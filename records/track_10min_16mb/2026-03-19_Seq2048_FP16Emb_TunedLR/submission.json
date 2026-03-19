@@ -1,0 +1,11 @@
+{
+  "author": "yahya010",
+  "github_id": "yahya010",
+  "name": "Seq2048 + FP16 Tied Embedding + Tuned LR",
+  "blurb": "SP-1024 9x512 KV4 with seq_len=2048, fp16 tied embedding passthrough, MLP hidden trimmed to 960, lower LRs (MATRIX=0.032 SCALAR=0.032 TIED_EMBED=0.04), warmdown=3600.",
+  "date": "2026-03-19",
+  "val_loss": 2.03702605,
+  "val_bpb": 1.20644157,
+  "bytes_total": 15632845,
+  "bytes_code": 48640
+}
