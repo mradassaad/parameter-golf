@@ -612,11 +612,26 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
 
+def _fake_quantize_int6(w: Tensor) -> Tensor:
+    """STE fake int6 quantization: forward uses quantized values, backward passes through."""
+    # Use amax instead of quantile — compile-friendly and O(n) per row
+    clip_abs = w.abs().amax(dim=1).clamp_min(1.0 / 31.0)
+    scale = clip_abs / 31.0
+    q = (w / scale[:, None]).round().clamp(-31, 31)
+    dequant = q * scale[:, None]
+    return w + (dequant - w).detach()  # STE: forward=quantized, backward=identity
+
+# Global flag to enable/disable QAT (disabled during eval)
+_QAT_ENABLED = False
+
 class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
     def forward(self, x: Tensor) -> Tensor:
+        w = self.weight.to(x.dtype)
+        if _QAT_ENABLED and self.weight.ndim == 2:
+            w = _fake_quantize_int6(w)
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, self.weight.to(x.dtype), bias)
+        return F.linear(x, w, bias)
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -1097,6 +1112,10 @@ def main() -> None:
     # MAIN TRAINING LOOP
     # -----------------------------
 
+    global _QAT_ENABLED
+    _QAT_ENABLED = USE_INT6  # Enable QAT during training if using int6
+    log0(f"qat_enabled:{_QAT_ENABLED}")
+
     training_time_ms = 0.0
     stop_after_step: int | None = None
     torch.cuda.synchronize()
@@ -1187,6 +1206,7 @@ def main() -> None:
         if stop_after_step is None and reached_cap:
             stop_after_step = step
 
+    _QAT_ENABLED = False  # Disable QAT for eval/serialization
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
