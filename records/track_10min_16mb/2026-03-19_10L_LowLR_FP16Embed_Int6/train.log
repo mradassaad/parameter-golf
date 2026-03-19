@@ -1,0 +1,53 @@
+logs/h100_10L_fp16emb_int6wide_s1337.txt
+val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path=./data/tokenizers/fineweb_1024_bpe.model
+train_loader:dataset:fineweb10B_sp1024 train_shards:80
+val_loader:shards pattern=./data/datasets/fineweb10B_sp1024/fineweb_val_*.bin tokens:62021632
+model_params:18897488
+world_size:8 grad_accum_steps:1
+sdp_backends:cudnn=False flash=True mem_efficient=False math=False
+attention_mode:gqa num_heads:8 num_kv_heads:4
+tie_embeddings:True embed_lr:0.03 head_lr:0.0 matrix_lr:0.02 scalar_lr:0.02
+train_batch_tokens:524288 train_seq_len:1024 iterations:20000 warmup_steps:20 max_wallclock_seconds:600.000
+seed:1337
+warmup_step:1/20
+warmup_step:2/20
+warmup_step:3/20
+warmup_step:4/20
+warmup_step:5/20
+warmup_step:6/20
+warmup_step:7/20
+warmup_step:8/20
+warmup_step:9/20
+warmup_step:10/20
+warmup_step:11/20
+warmup_step:12/20
+warmup_step:13/20
+warmup_step:14/20
+warmup_step:15/20
+warmup_step:16/20
+warmup_step:17/20
+warmup_step:18/20
+warmup_step:19/20
+warmup_step:20/20
+step:0/20000 val_loss:6.9363 val_bpb:4.1080 train_time:0ms step_avg:0.01ms
+step:12000/20000 val_loss:2.0514 val_bpb:1.2150 train_time:582773ms step_avg:48.56ms
+step:12355/20000 val_loss:2.0412 val_bpb:1.2089 train_time:600034ms step_avg:48.57ms
+stopping_early: wallclock_cap train_time:600034ms step:12355/20000
+peak memory allocated: 11262 MiB reserved: 11450 MiB
+Serialized model: 74578915 bytes
+Code size: 50069 bytes
+Total submission size: 74628984 bytes
+Serialized model int8+zlib: 15361072 bytes (payload:19552576 raw_torch:19602363 payload_ratio:3.81x)
+Total submission size int8+zlib: 15411141 bytes
+final_int8_zlib_roundtrip val_loss:2.0468 val_bpb:1.2123 eval_time:1578ms
+final_int8_zlib_roundtrip_exact val_loss:2.04683482 val_bpb:1.21225087
+====================================================================================================
+Multi-seed summary (5 seeds: 1337, 42, 123, 7, 2024):
+Seed 1337: val_loss=2.04683482 val_bpb=1.21225087 artifact=15361072
+Seed 42:   val_loss=2.04998529 val_bpb=1.21411676 artifact=15358320
+Seed 123:  val_loss=2.04799422 val_bpb=1.21293753 artifact=15355036
+Seed 7:    val_loss=2.04579765 val_bpb=1.21163660 artifact=15362933
+Seed 2024: val_loss=2.04872971 val_bpb=1.21337313 artifact=15362170
+Mean: val_loss=2.04786834 val_bpb=1.21286298
+Std:  val_loss=0.00162751
+t-statistic: 34.12 (df=4, p<<0.001)
