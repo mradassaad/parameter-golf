@@ -1,0 +1,7 @@
+{
+  "name": "10L Int5-MLP + MuonWD=0.04 + SWA/50 + SmearGate + BigramHash",
+  "val_bpb": 1.14526,
+  "artifact_bytes": 15521020,
+  "blurb": "10 layers with mixed int5/int6 quantization (int5 for MLP, int6 for attention). Int5 MLP compression saves 1.86MB vs uniform int6, funding the extra layer. Weight decay=0.04 improves quantization friendliness. SWA every 50 steps (~29 checkpoint average). SmearGate + BigramHash + OrthoInit + zstd-22.",
+  "authors": ["thwu1"]
+}
