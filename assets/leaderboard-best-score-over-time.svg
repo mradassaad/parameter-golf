@@ -1,0 +1,89 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 560" role="img" aria-labelledby="title desc">
+  <title id="title">Running best leaderboard score over submission time</title>
+  <desc id="desc">A chart of the running best val_bpb for the current README leaderboard entries, using submission folder commit times on the x-axis in UTC.</desc>
+  <style>
+    :root {
+      --bg: #ffffff;
+      --panel: #f8fafc;
+      --panel-stroke: #d7e0e8;
+      --grid: #d7e0e8;
+      --axis: #425466;
+      --tick: #425466;
+      --note: #51606f;
+      --points: #94a3b8;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0b1220;
+        --panel: #101a2d;
+        --panel-stroke: #263449;
+        --grid: #334155;
+        --axis: #cbd5e1;
+        --tick: #cbd5e1;
+        --note: #94a3b8;
+        --points: #94a3b8;
+      }
+    }
+    .bg { fill: var(--bg); }
+    .panel { fill: var(--panel); stroke: var(--panel-stroke); stroke-width: 1.5; }
+    .grid { stroke: var(--grid); stroke-width: 1; stroke-dasharray: 4 6; }
+    .axis { stroke: var(--axis); stroke-width: 1.5; }
+    .tick { fill: var(--tick); font: 14px ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    .all-points { fill: var(--points); opacity: 0.72; }
+    .best-line { fill: none; stroke: rgb(0,128,128); stroke-width: 4; stroke-linejoin: round; stroke-linecap: round; }
+    .best-point { fill: #ffffff; stroke: rgb(0,128,128); stroke-width: 3; }
+  </style>
+
+  <rect class="bg" x="0" y="0" width="1000" height="560" />
+  <rect class="panel" x="90" y="60" width="870" height="412" />
+
+  <line class="grid" x1="90" y1="454.7" x2="960" y2="454.7" />
+  <line class="grid" x1="90" y1="367.9" x2="960" y2="367.9" />
+  <line class="grid" x1="90" y1="281.2" x2="960" y2="281.2" />
+  <line class="grid" x1="90" y1="194.4" x2="960" y2="194.4" />
+  <line class="grid" x1="90" y1="107.7" x2="960" y2="107.7" />
+
+  <line class="grid" x1="224.7" y1="60" x2="224.7" y2="472" />
+  <line class="grid" x1="441.3" y1="60" x2="441.3" y2="472" />
+  <line class="grid" x1="657.8" y1="60" x2="657.8" y2="472" />
+  <line class="grid" x1="874.3" y1="60" x2="874.3" y2="472" />
+
+  <line class="axis" x1="90" y1="472" x2="960" y2="472" />
+  <line class="axis" x1="90" y1="60" x2="90" y2="472" />
+
+  <circle class="all-points" cx="90.0" cy="88.6" r="5.5" />
+  <circle class="all-points" cx="425.1" cy="354.9" r="5.5" />
+  <circle class="all-points" cx="536.6" cy="109.0" r="5.5" />
+  <circle class="all-points" cx="539.2" cy="168.4" r="5.5" />
+  <circle class="all-points" cx="603.9" cy="227.0" r="5.5" />
+  <circle class="all-points" cx="605.0" cy="188.4" r="5.5" />
+  <circle class="all-points" cx="607.6" cy="303.7" r="5.5" />
+  <circle class="all-points" cx="625.2" cy="374.0" r="5.5" />
+  <circle class="all-points" cx="629.8" cy="130.7" r="5.5" />
+  <circle class="all-points" cx="630.9" cy="225.7" r="5.5" />
+  <circle class="all-points" cx="719.9" cy="387.0" r="5.5" />
+  <circle class="all-points" cx="762.0" cy="429.5" r="5.5" />
+  <circle class="all-points" cx="918.7" cy="410.4" r="5.5" />
+  <circle class="all-points" cx="960.0" cy="442.5" r="5.5" />
+
+  <path class="best-line" d="M 90.0 88.6 L 425.1 88.6 L 425.1 354.9 L 625.2 354.9 L 625.2 374.0 L 719.9 374.0 L 719.9 387.0 L 762.0 387.0 L 762.0 429.5 L 960.0 429.5 L 960.0 442.5" />
+
+  <circle class="best-point" cx="90.0" cy="88.6" r="6.5" />
+  <circle class="best-point" cx="425.1" cy="354.9" r="6.5" />
+  <circle class="best-point" cx="625.2" cy="374.0" r="6.5" />
+  <circle class="best-point" cx="719.9" cy="387.0" r="6.5" />
+  <circle class="best-point" cx="762.0" cy="429.5" r="6.5" />
+  <circle class="best-point" cx="960.0" cy="442.5" r="6.5" />
+
+  <text class="tick" x="82" y="459" text-anchor="end">1.14</text>
+  <text class="tick" x="82" y="372" text-anchor="end">1.16</text>
+  <text class="tick" x="82" y="285" text-anchor="end">1.18</text>
+  <text class="tick" x="82" y="199" text-anchor="end">1.20</text>
+  <text class="tick" x="82" y="112" text-anchor="end">1.22</text>
+
+  <text class="tick" x="224.7" y="496" text-anchor="middle">Mar 19</text>
+  <text class="tick" x="657.8" y="496" text-anchor="middle">Mar 20</text>
+
+  <text class="tick" x="28" y="268" transform="rotate(-90 28 268)" text-anchor="middle">Best Validation Loss</text>
+  <text class="tick" x="525" y="518" text-anchor="middle">Submission time (UTC)</text>
+</svg>
