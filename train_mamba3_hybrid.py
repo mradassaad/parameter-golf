@@ -90,6 +90,7 @@ class Hyperparameters:
     gptq_damp = float(os.environ.get("GPTQ_DAMP", "0.01"))  # Hessian damping factor (λI added for stability)
     late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", "0.0"))  # enable QAT when lr_mul drops below this (SOTA uses 0.15)
     fp16_inproj_rows = bool(int(os.environ.get("FP16_INPROJ_ROWS", "1")))  # store recurrence rows in FP16 (0 = quantize all rows)
+    target_mb = float(os.environ.get("TARGET_MB", "15.9"))  # target compressed submission size in MB (selective ±1 pruning)
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -1661,6 +1662,52 @@ def main() -> None:
         quant_bits_mlp=args.quant_bits_mlp, search_clip=args.gptq_lite,
         fp16_row_masks=fp16_masks_for_quant,
     )
+    # Selective ±1 pruning: zero out least-impactful ±1 quantized values to fit target size
+    if args.use_lzma and args.target_mb > 0 and master_process:
+        target_bytes = int(args.target_mb * 1024 * 1024)
+        code_bytes_est = len(code.encode("utf-8"))
+        ones_info = []
+        for name, q in quant_obj["quantized"].items():
+            s = quant_obj["scales"].get(name)
+            if s is None or s.ndim == 0:
+                continue
+            ones_mask = (q.abs() == 1)
+            if ones_mask.any():
+                row_idx = torch.arange(q.shape[0]).unsqueeze(1).expand_as(q)[ones_mask]
+                flat_idx = torch.arange(q.numel()).reshape(q.shape)[ones_mask]
+                errors = s.float()[row_idx].pow(2)
+                for fi, err in zip(flat_idx.tolist(), errors.tolist()):
+                    ones_info.append((name, fi, err))
+        if ones_info:
+            ones_info.sort(key=lambda x: x[2])
+            def _try_prune(n):
+                tmp_q = {k: v.clone() for k, v in quant_obj["quantized"].items()}
+                for i in range(min(n, len(ones_info))):
+                    tmp_q[ones_info[i][0]].view(-1)[ones_info[i][1]] = 0
+                tmp_obj = {**quant_obj, "quantized": tmp_q}
+                buf = io.BytesIO()
+                torch.save(tmp_obj, buf)
+                return len(lzma.compress(buf.getvalue(), preset=9)) + code_bytes_est, tmp_q
+            no_sz, _ = _try_prune(0)
+            log0(f"selective_prune: {len(ones_info)} ±1 candidates, unpruned={no_sz/(1024*1024):.2f}MB target={args.target_mb}MB")
+            if no_sz <= target_bytes:
+                log0("selective_prune: already fits, no pruning needed")
+            else:
+                full_sz, _ = _try_prune(len(ones_info))
+                log0(f"selective_prune: full ±1 prune={full_sz/(1024*1024):.2f}MB")
+                if full_sz > target_bytes:
+                    log0("selective_prune: even full prune not enough, applying all")
+                    _, quant_obj["quantized"] = _try_prune(len(ones_info))
+                else:
+                    lo, hi = 0, len(ones_info)
+                    while lo < hi:
+                        mid = (lo + hi) // 2
+                        sz, _ = _try_prune(mid)
+                        if sz <= target_bytes: hi = mid
+                        else: lo = mid + 1
+                    log0(f"selective_prune: pruning {lo}/{len(ones_info)} ±1 values ({100*lo/len(ones_info):.1f}%) to fit {args.target_mb}MB")
+                    _, quant_obj["quantized"] = _try_prune(lo)
+
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
