@@ -590,6 +590,7 @@ def quantize_int6_gptq(
         Hinv = torch.cholesky_inverse(Hinv)
         Hinv = torch.linalg.cholesky(Hinv, upper=True)
     except torch.linalg.LinAlgError:
+        print(f"gptq:cholesky_fallback shape={tuple(weight.shape)} dead={int(dead.sum())}/{cols}", flush=True)
         return _quantize_int6_percentile(weight, clip_range=clip_range)
     best_q, best_scale, best_err = None, None, float("inf")
     for pct in [0.9990, 0.9995, 0.9999, 0.99999, 1.0]:
