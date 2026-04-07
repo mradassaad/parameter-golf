@@ -41,10 +41,12 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 class Hyperparameters:
     # Data paths are shard globs produced by the existing preprocessing pipeline.
-    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
+    # Defaults auto-select based on VOCAB_SIZE (e.g. 4096 → fineweb10B_sp4096).
+    _vs = os.environ.get("VOCAB_SIZE", "1024")
+    data_path = os.environ.get("DATA_PATH", f"./data/datasets/fineweb10B_sp{_vs}")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
-    tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
+    tokenizer_path = os.environ.get("TOKENIZER_PATH", f"./data/tokenizers/fineweb_{_vs}_bpe.model")
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed = int(os.environ.get("SEED", 1337))
 
@@ -66,7 +68,6 @@ class Hyperparameters:
     # Evaluation.
     eval_stride = int(os.environ.get("EVAL_STRIDE", 16))  # sliding window stride (0 = disabled)
     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))  # batch size for sliding eval
-    stateful_eval = bool(int(os.environ.get("STATEFUL_EVAL", "0")))  # carry SSM state across eval windows
     # Test-Time Training (TTT): online adaptation on val data during scoring
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
     ttt_lr = float(os.environ.get("TTT_LR", 0.002))
@@ -92,8 +93,6 @@ class Hyperparameters:
     late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", "0.0"))  # enable QAT when lr_mul drops below this (SOTA uses 0.15)
     fp16_inproj_rows = bool(int(os.environ.get("FP16_INPROJ_ROWS", "1")))  # store recurrence rows in FP16 (0 = quantize all rows)
     target_mb = float(os.environ.get("TARGET_MB", "15.25"))  # target compressed submission size in MiB (16,000,000 bytes = 15.25 MiB)
-    recur_layers = [int(x) for x in os.environ.get("RECUR_LAYERS", "").split(",") if x]  # depth recurrence: repeat these layer indices
-    recur_start_step = int(os.environ.get("RECUR_START_STEP", "3000"))  # delay recurrence until this step
     muon_eq_r = bool(int(os.environ.get("MUON_EQ_R", "0")))  # MuonEq-R: row-normalize before Newton-Schulz
 
     # Model shape.
@@ -393,79 +392,6 @@ def eval_val_sliding(
     base_model.train()
     return float(val_loss), float(bits_per_token * tokens_per_byte)
 
-
-def eval_val_stateful(
-    args: Hyperparameters, base_model: nn.Module, rank: int, world_size: int,
-    device: torch.device, val_tokens: Tensor, base_bytes_lut: Tensor,
-    has_leading_space_lut: Tensor, is_boundary_token_lut: Tensor,
-) -> tuple[float, float]:
-    """Stateful eval: carry SSM state across non-overlapping windows.
-
-    Splits the val set into world_size segments. Each rank processes one segment
-    sequentially, carrying SSM hidden state across windows. This gives SSM layers
-    unlimited prior context while attention still sees within each window.
-    """
-    seq_len = args.train_seq_len
-    total_tokens = val_tokens.numel() - 1  # need target for last token
-
-    # Split into world_size segments, each a multiple of seq_len
-    segment_tokens = (total_tokens // world_size // seq_len) * seq_len
-    if segment_tokens == 0:
-        raise ValueError(f"Val set too small for stateful eval: {total_tokens} tokens, {world_size} GPUs, seq_len={seq_len}")
-    seg_start = rank * segment_tokens
-
-    num_windows = segment_tokens // seq_len
-    if rank == 0:
-        print(f"stateful_eval: {num_windows} windows/rank, {segment_tokens} tokens/rank, {world_size} ranks")
-
-    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
-    token_count = torch.zeros((), device=device, dtype=torch.float64)
-    byte_count = torch.zeros((), device=device, dtype=torch.float64)
-
-    base_model.eval()
-    layer_states = None  # SSM state, initialized on first forward
-
-    with torch.inference_mode():
-        for wi in range(num_windows):
-            tok_start = seg_start + wi * seq_len
-            chunk = val_tokens[tok_start:tok_start + seq_len + 1].to(dtype=torch.int64)
-            x = chunk[:-1].unsqueeze(0).to(device=device, non_blocking=True)
-            y = chunk[1:].unsqueeze(0).to(device=device, non_blocking=True)
-
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                logits, layer_states = base_model.forward_logits_stateful(x, layer_states)
-
-            # Detach states to avoid graph accumulation
-            layer_states = [tuple(s.detach() for s in st) for st in layer_states]
-
-            scaled_logits = logits.float()
-            if args.eval_temp != 1.0:
-                scaled_logits = scaled_logits / args.eval_temp
-            nll = F.cross_entropy(
-                scaled_logits.reshape(-1, scaled_logits.size(-1)),
-                y.reshape(-1),
-                reduction="none",
-            )
-
-            loss_sum += nll.to(torch.float64).sum()
-            token_count += seq_len
-
-            prev_ids = x.squeeze(0)
-            tgt_ids = y.squeeze(0)
-            tbytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
-            tbytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
-            byte_count += tbytes.to(torch.float64).sum()
-
-    if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
-        dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
-        dist.all_reduce(byte_count, op=dist.ReduceOp.SUM)
-
-    val_loss = (loss_sum / token_count).item()
-    bits_per_token = val_loss / math.log(2.0)
-    tokens_per_byte = token_count.item() / byte_count.item()
-    base_model.train()
-    return float(val_loss), float(bits_per_token * tokens_per_byte)
 
 
 # QUANTIZATION
@@ -1018,61 +944,6 @@ class Mamba3Layer(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         return self.mamba3(x)
 
-    def forward_stateful(self, x: Tensor, input_states=None):
-        """Forward with SSM state carry. Returns (output, final_states).
-        final_states is a 4-tuple: (angle_state, ssm_state, k_state, v_state).
-        """
-        from einops import rearrange
-        from mamba_ssm.ops.triton.mamba3.mamba3_siso_combined import mamba3_siso_combined
-
-        m = self.mamba3
-        batch, seqlen, dim = x.shape
-
-        # Replicate Mamba3.forward preprocessing (lines 153-184 of mamba3.py)
-        zxBCdtAtrap = m.in_proj(x)
-        z, xv, B, C, dd_dt, dd_A, trap, angles = torch.split(
-            zxBCdtAtrap,
-            [m.d_inner, m.d_inner,
-             m.d_state * m.num_bc_heads * m.mimo_rank,
-             m.d_state * m.num_bc_heads * m.mimo_rank,
-             m.nheads, m.nheads, m.nheads, m.num_rope_angles],
-            dim=-1)
-        z = rearrange(z, "b l (h p) -> b l h p", p=m.headdim)
-        xv = rearrange(xv, "b l (h p) -> b l h p", p=m.headdim)
-        B = rearrange(B, "b l (r g n) -> b l r g n", r=m.mimo_rank, g=m.num_bc_heads)
-        C = rearrange(C, "b l (r g n) -> b l r g n", r=m.mimo_rank, g=m.num_bc_heads)
-        trap = rearrange(trap, "b l h -> b h l")
-
-        _A = -F.softplus(dd_A.to(torch.float32))
-        _A = torch.clamp(_A, max=-m.A_floor)
-        DT = F.softplus(dd_dt + m.dt_bias)
-        ADT = _A * DT
-        DT = rearrange(DT, "b l n -> b n l")
-        ADT = rearrange(ADT, "b l n -> b n l")
-
-        angles = angles.unsqueeze(-2).expand(-1, -1, m.nheads, -1)
-        B = m.B_norm(B)
-        C = m.C_norm(C)
-
-        result = mamba3_siso_combined(
-            Q=C.squeeze(2), K=B.squeeze(2), V=xv,
-            ADT=ADT, DT=DT, Trap=trap,
-            Q_bias=m.C_bias.squeeze(1), K_bias=m.B_bias.squeeze(1),
-            Angles=angles, D=m.D,
-            Z=z if not m.is_outproj_norm else None,
-            chunk_size=m.chunk_size,
-            Input_States=input_states,
-            return_final_states=True,
-        )
-        y, last_angle, last_state, last_k, last_v, *rest = result
-        final_states = (last_angle, last_state, last_k, last_v)
-
-        y = rearrange(y, "b l h p -> b l (h p)")
-        if m.is_outproj_norm:
-            z = rearrange(z, "b l h p -> b l (h p)")
-            y = m.norm(y, z)
-        out = m.out_proj(y.to(xv.dtype))
-        return out, final_states
 
 
 class Rotary(nn.Module):
@@ -1207,14 +1078,6 @@ class Block(nn.Module):
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
-    def forward_stateful(self, x: Tensor, x0: Tensor, v_embed: Tensor | None = None, ssm_states=None):
-        """Forward with SSM state carry. Returns (output, final_states)."""
-        mix = self.resid_mix.to(dtype=x.dtype)
-        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        m3_out, final_states = self.mamba3.forward_stateful(self.m3_norm(x), input_states=ssm_states)
-        x = x + self.m3_scale.to(dtype=x.dtype)[None, None, :] * m3_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
-        return x, final_states
 
 
 class AttnBlock(nn.Module):
@@ -1361,28 +1224,22 @@ class GPT(nn.Module):
             x = self.smeargate(x)
         return F.rms_norm(x, (x.size(-1),))
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor, recur_layers: list[int] | None = None) -> Tensor:
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self._embed(input_ids)
-        x = self._run_blocks(x, x, input_ids, recur_layers=recur_layers)
+        x = self._run_blocks(x, x, input_ids)
         return self._compute_logits_and_loss(x, target_ids)
 
-    def _run_blocks(self, x: Tensor, x0: Tensor, input_ids: Tensor | None = None,
-                    recur_layers: list[int] | None = None) -> Tensor:
+    def _run_blocks(self, x: Tensor, x0: Tensor, input_ids: Tensor | None = None) -> Tensor:
         ve_cache = self.ve_shared(input_ids) if (self.ve_shared is not None and input_ids is not None) else None
-        recur_set = set(recur_layers) if recur_layers else set()
         skips: list[Tensor] = []
         for i in range(self.num_encoder_layers):
             x = self.blocks[i](x, x0, v_embed=self._get_ve(i, ve_cache))
             skips.append(x)
-            if i in recur_set:
-                x = self.blocks[i](x, x0, v_embed=self._get_ve(i, ve_cache))
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
             if skips:
                 x = x + self.skip_weights[0, i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[bi](x, x0, v_embed=self._get_ve(bi, ve_cache))
-            if bi in recur_set:
-                x = self.blocks[bi](x, x0, v_embed=self._get_ve(bi, ve_cache))
         return x
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
@@ -1394,46 +1251,6 @@ class GPT(nn.Module):
         logits = self.logit_softcap * torch.tanh(F.linear(x, w) / self.logit_softcap)
         return logits.reshape(bsz, seqlen, -1)
 
-    def _run_blocks_stateful(self, x: Tensor, x0: Tensor, input_ids: Tensor | None = None,
-                             layer_states: list | None = None):
-        """Like _run_blocks but carries SSM state per layer. Returns (output, new_layer_states)."""
-        ve_cache = self.ve_shared(input_ids) if (self.ve_shared is not None and input_ids is not None) else None
-        new_states: list = []
-        si = 0  # state index (only SSM blocks have state)
-        skips: list[Tensor] = []
-        for i in range(self.num_encoder_layers):
-            block = self.blocks[i]
-            if isinstance(block, Block):
-                prev = layer_states[si] if layer_states is not None else None
-                x, fstate = block.forward_stateful(x, x0, v_embed=self._get_ve(i, ve_cache), ssm_states=prev)
-                new_states.append(fstate)
-                si += 1
-            else:
-                x = block(x, x0, v_embed=self._get_ve(i, ve_cache))
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            bi = self.num_encoder_layers + i
-            if skips:
-                x = x + self.skip_weights[0, i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            block = self.blocks[bi]
-            if isinstance(block, Block):
-                prev = layer_states[si] if layer_states is not None else None
-                x, fstate = block.forward_stateful(x, x0, v_embed=self._get_ve(bi, ve_cache), ssm_states=prev)
-                new_states.append(fstate)
-                si += 1
-            else:
-                x = block(x, x0, v_embed=self._get_ve(bi, ve_cache))
-        return x, new_states
-
-    def forward_logits_stateful(self, input_ids: Tensor, layer_states: list | None = None):
-        """Forward returning (logits, new_layer_states) for stateful eval."""
-        bsz, seqlen = input_ids.shape
-        x = self._embed(input_ids)
-        x, new_states = self._run_blocks_stateful(x, x, input_ids, layer_states)
-        x = self.final_norm(x).reshape(-1, x.size(-1))
-        w = self.tok_emb.weight if self.tie_embeddings else self.lm_head.weight
-        logits = self.logit_softcap * torch.tanh(F.linear(x, w) / self.logit_softcap)
-        return logits.reshape(bsz, seqlen, -1), new_states
 
 
 # -----------------------------
@@ -1598,8 +1415,6 @@ def main() -> None:
     log0(f"ssd: d_state:{args.mamba3_d_state} expand:{args.mamba3_expand} headdim:{args.mamba3_headdim} ngroups:{args.mamba3_ngroups} rope_frac:{args.mamba3_rope_fraction} outproj_norm:{args.mamba3_outproj_norm}")
     log0(f"attn: num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads} rope_base:{args.rope_base}")
     log0(f"num_layers:{args.num_layers} mlp_mult:{args.mlp_mult}")
-    if args.recur_layers:
-        log0(f"depth_recurrence: layers={args.recur_layers} start_step={args.recur_start_step}")
     if args.muon_eq_r:
         log0(f"muon_eq_r:enabled")
     log0(
@@ -1723,19 +1538,15 @@ def main() -> None:
                     if isinstance(m, CastedLinear):
                         m._qat_bits = qat_bits
 
-        if args.recur_layers and step == args.recur_start_step:
-            log0(f"depth_recurrence:enabled layers={args.recur_layers} at step {step}")
-
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         cur_seq_len = args.train_seq_len
-        active_recur = args.recur_layers if (args.recur_layers and step >= args.recur_start_step) else None
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, cur_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y, recur_layers=active_recur)
+                loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
@@ -2050,13 +1861,7 @@ def main() -> None:
     t_qeval = time.perf_counter()
 
     if not args.ttt_enabled:
-        if args.stateful_eval:
-            q_val_loss, q_val_bpb = eval_val_stateful(
-                args, base_model, rank, world_size, device,
-                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-            )
-            eval_mode = "stateful"
-        elif args.eval_stride > 0 and args.eval_stride < args.train_seq_len:
+        if args.eval_stride > 0 and args.eval_stride < args.train_seq_len:
             q_val_loss, q_val_bpb = eval_val_sliding(
                 args, base_model, rank, world_size, device,
                 val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
