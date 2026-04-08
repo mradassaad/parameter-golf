@@ -1,14 +1,15 @@
-"""Profile a few training steps to understand where wall time goes.
-Outputs a chrome trace (viewable in chrome://tracing or Perfetto)
-and a summary table of top kernels."""
+"""Profile training steps: baseline vs torch.compile.
+Outputs chrome traces and summary tables."""
 
-import os, sys, time
+import os, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.chdir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 import torch.nn.functional as F
-from torch.profiler import profile, ProfilerActivity, schedule
+from torch.profiler import profile, ProfilerActivity
+import time
+import copy
 
 # Set env vars to match our standard config
 for k, v in {
@@ -18,7 +19,7 @@ for k, v in {
 }.items():
     os.environ.setdefault(k, v)
 
-from train_mamba3_hybrid import Hyperparameters, GPT, load_validation_tokens
+from train_mamba3_hybrid import Hyperparameters, GPT
 
 args = Hyperparameters()
 device = torch.device("cuda")
@@ -46,67 +47,77 @@ model = GPT(
 
 print(f"Model: {sum(p.numel() for p in model.parameters())/1e6:.1f}M params")
 
-# Fake batch (same shape as training)
+# Fake batch
 seq_len = args.train_seq_len
-# micro_batch = train_batch_tokens / 8 = 1M / 8 = 131072 tokens = 32 seqs @ 4096
 bsz = 131072 // seq_len
 x = torch.randint(0, args.vocab_size, (bsz, seq_len), device=device)
 y = torch.randint(0, args.vocab_size, (bsz, seq_len), device=device)
-
 print(f"Batch: {bsz} seqs x {seq_len} tokens = {bsz * seq_len} tokens/step")
 
-# Warmup (covers Triton autotune)
-print("Warming up (20 steps)...")
-model.train()
-for i in range(20):
-    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        loss = model(x, y)
-    loss.backward()
-    model.zero_grad()
-    if i % 5 == 0:
-        print(f"  warmup step {i}")
 
-torch.cuda.synchronize()
-print("Warmup done. Profiling...")
+def bench_and_profile(model, label, trace_name, warmup=20, bench=50, profile_steps=5):
+    """Warmup, benchmark wall time, then profile."""
+    model.train()
 
-# Profile 5 steps
-NUM_PROFILE_STEPS = 5
-
-with profile(
-    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-    with_stack=True,
-    record_shapes=True,
-    profile_memory=True,
-    with_flops=True,
-) as prof:
-    for step in range(NUM_PROFILE_STEPS):
+    # Warmup
+    print(f"\n{'='*60}")
+    print(f"[{label}] Warming up ({warmup} steps)...")
+    for i in range(warmup):
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             loss = model(x, y)
         loss.backward()
         model.zero_grad()
-        torch.cuda.synchronize()
+    torch.cuda.synchronize()
 
-# Export chrome trace
-trace_path = "profiling/trace_mamba3_hybrid.json"
-prof.export_chrome_trace(trace_path)
-print(f"\nChrome trace saved to: {trace_path}")
-print("Open in chrome://tracing or https://ui.perfetto.dev/\n")
+    # Benchmark wall time
+    print(f"[{label}] Benchmarking ({bench} steps)...")
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(bench):
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            loss = model(x, y)
+        loss.backward()
+        model.zero_grad()
+    torch.cuda.synchronize()
+    elapsed = time.perf_counter() - t0
+    ms_per_step = elapsed / bench * 1000
+    print(f"[{label}] {ms_per_step:.1f} ms/step ({bench} steps, {elapsed:.2f}s total)")
 
-# Print summary tables
-print("=" * 80)
-print("TOP 30 CUDA KERNELS BY TOTAL TIME")
-print("=" * 80)
-print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=30))
+    # Profile
+    print(f"[{label}] Profiling ({profile_steps} steps)...")
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        record_shapes=True,
+        profile_memory=True,
+    ) as prof:
+        for _ in range(profile_steps):
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                loss = model(x, y)
+            loss.backward()
+            model.zero_grad()
+            torch.cuda.synchronize()
 
-print("\n" + "=" * 80)
-print("TOP 20 BY SELF CUDA TIME")
-print("=" * 80)
-print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=20))
+    prof.export_chrome_trace(f"profiling/{trace_name}")
+    print(f"[{label}] Trace saved: profiling/{trace_name}")
 
-# Count kernel launches
-events = prof.key_averages()
-total_cuda_time = sum(e.cuda_time_total for e in events if e.cuda_time_total > 0)
-total_calls = sum(e.count for e in events if e.cuda_time_total > 0)
-print(f"\nTotal CUDA time: {total_cuda_time / 1e6:.1f}s over {NUM_PROFILE_STEPS} steps")
-print(f"Total kernel calls: {total_calls} ({total_calls // NUM_PROFILE_STEPS}/step)")
-print(f"Avg step time: {total_cuda_time / NUM_PROFILE_STEPS / 1e6:.3f}s")
+    print(f"\n[{label}] TOP 20 SELF CUDA TIME")
+    print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=20))
+
+    return ms_per_step
+
+
+# --- Baseline (no compile) ---
+ms_baseline = bench_and_profile(model, "baseline", "trace_baseline.json")
+
+# --- Compiled model ---
+print("\n\nCompiling model with torch.compile...")
+compiled_model = torch.compile(model)
+ms_compiled = bench_and_profile(compiled_model, "compiled", "trace_compiled.json")
+
+# --- Summary ---
+print("\n" + "=" * 60)
+print("SUMMARY")
+print("=" * 60)
+print(f"Baseline:  {ms_baseline:.1f} ms/step")
+print(f"Compiled:  {ms_compiled:.1f} ms/step")
+print(f"Speedup:   {ms_baseline / ms_compiled:.2f}x ({ms_baseline - ms_compiled:.1f} ms saved)")

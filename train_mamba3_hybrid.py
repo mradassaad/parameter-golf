@@ -1017,9 +1017,11 @@ class Mamba3Layer(nn.Module):
                 dst.bias = src.bias
             setattr(self.mamba3, attr, dst)
 
+    @torch._dynamo.disable
     def forward(self, x: Tensor) -> Tensor:
         return self.mamba3(x)
 
+    @torch._dynamo.disable
     def forward_stateful(self, x: Tensor, input_states=None):
         """Forward with SSM state carry. Returns (output, final_states)."""
         from einops import rearrange
