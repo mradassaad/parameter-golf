@@ -1752,9 +1752,10 @@ def main() -> None:
         compress_fmt = "zlib-9"
     quant_raw_bytes = len(quant_raw)
     if master_process:
-        with open("final_model.int8.ptz", "wb") as f:
+        quant_filename = f"final_model.int{args.quant_bits}.ptz"
+        with open(quant_filename, "wb") as f:
             f.write(quant_blob)
-        quant_file_bytes = os.path.getsize("final_model.int8.ptz")
+        quant_file_bytes = os.path.getsize(quant_filename)
         code_bytes = len(code.encode("utf-8"))
         ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
         log0(
@@ -1765,7 +1766,7 @@ def main() -> None:
 
     if distributed:
         dist.barrier()
-    with open("final_model.int8.ptz", "rb") as f:
+    with open(quant_filename, "rb") as f:
         quant_blob_disk = f.read()
     if args.use_lzma:
         quant_decompressed = lzma.decompress(quant_blob_disk)
