@@ -1,13 +1,15 @@
-"""Profile training steps: 1-GPU baseline vs compiled, then optionally 8-GPU."""
+"""Profile 8-GPU DDP training: baseline vs compiled.
+Run with: torchrun --nproc_per_node=8 profiling/profile_ddp.py"""
 
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.chdir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 import time
 
-# Set env vars to match our standard config
 for k, v in {
     "FP16_INPROJ_ROWS": "0", "WARMDOWN_ITERS": "2600", "WARMDOWN_SHAPE": "linear",
     "MUON_EQ_R": "1", "LATE_QAT_THRESHOLD": "0.15", "WEIGHT_DECAY": "0.04",
@@ -15,15 +17,24 @@ for k, v in {
 }.items():
     os.environ.setdefault(k, v)
 
-from train_mamba3_hybrid import Hyperparameters, GPT
+from train_mamba3_hybrid import Hyperparameters, GPT, CastedLinear, restore_low_dim_params_to_fp32
 
 args = Hyperparameters()
-device = torch.device("cuda")
+rank = int(os.environ["RANK"])
+world_size = int(os.environ["WORLD_SIZE"])
+local_rank = int(os.environ["LOCAL_RANK"])
+device = torch.device("cuda", local_rank)
+torch.cuda.set_device(device)
+dist.init_process_group(backend="nccl", device_id=device)
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
-# Build model
-model = GPT(
+def log0(msg):
+    if rank == 0:
+        print(msg, flush=True)
+
+# Build model (same as training script)
+base_model = GPT(
     vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
     mlp_mult=args.mlp_mult,
     tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
@@ -41,18 +52,22 @@ model = GPT(
     ve_enabled=args.ve_enabled, ve_dim=args.ve_dim,
 ).to(device).bfloat16()
 
-print(f"Model: {sum(p.numel() for p in model.parameters())/1e6:.1f}M params")
+for module in base_model.modules():
+    if isinstance(module, CastedLinear):
+        module.float()
+restore_low_dim_params_to_fp32(base_model)
 
-# Fake batch — same micro-batch as 8xH100 (each GPU gets 131072 tokens)
+log0(f"Model: {sum(p.numel() for p in base_model.parameters())/1e6:.1f}M params, {world_size} GPUs")
+
+# Fake batch — same micro-batch per GPU as real training
 seq_len = args.train_seq_len
-bsz = 131072 // seq_len
+bsz = 131072 // seq_len  # same as train: 1M / 8 GPUs = 131072 tokens/GPU
 x = torch.randint(0, args.vocab_size, (bsz, seq_len), device=device)
 y = torch.randint(0, args.vocab_size, (bsz, seq_len), device=device)
-print(f"Batch: {bsz} seqs x {seq_len} tokens = {bsz * seq_len} tokens/step")
+log0(f"Batch per GPU: {bsz} seqs x {seq_len} = {bsz * seq_len} tokens")
 
 
 def bench(model, label, warmup=20, steps=50):
-    """Warmup then benchmark wall time."""
     model.train()
     for _ in range(warmup):
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -60,6 +75,7 @@ def bench(model, label, warmup=20, steps=50):
         loss.backward()
         model.zero_grad()
     torch.cuda.synchronize()
+    dist.barrier()
 
     torch.cuda.synchronize()
     t0 = time.perf_counter()
@@ -71,17 +87,23 @@ def bench(model, label, warmup=20, steps=50):
     torch.cuda.synchronize()
     elapsed = time.perf_counter() - t0
     ms = elapsed / steps * 1000
-    print(f"[{label}] {ms:.1f} ms/step ({steps} steps)")
+    log0(f"[{label}] {ms:.1f} ms/step ({steps} steps)")
     return ms
 
 
-# --- 1. Baseline (no compile) ---
-ms_base = bench(model, "1GPU-baseline")
+# --- 1. DDP without compile ---
+model_nocompile = DDP(base_model, device_ids=[local_rank], broadcast_buffers=False)
+ms_ddp_nocompile = bench(model_nocompile, "8GPU-DDP-nocompile")
+del model_nocompile
 
-# --- 2. Compiled (no DDP) ---
-compiled = torch.compile(model, dynamic=False, fullgraph=False)
-ms_comp = bench(compiled, "1GPU-compiled", warmup=25)
+# --- 2. DDP with compile (matches training script) ---
+compiled_model = torch.compile(base_model, dynamic=False, fullgraph=False)
+model_compiled = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False)
+ms_ddp_compiled = bench(model_compiled, "8GPU-DDP-compiled", warmup=25)
 
-print(f"\n1-GPU speedup: {ms_base/ms_comp:.2f}x ({ms_base - ms_comp:.1f}ms saved)")
-print(f"\nDone. Now run with torchrun for 8-GPU DDP profile:")
-print(f"  torchrun --nproc_per_node=8 profiling/profile_ddp.py")
+log0(f"\n{'='*50}")
+log0(f"8-GPU DDP no-compile:  {ms_ddp_nocompile:.1f} ms/step")
+log0(f"8-GPU DDP compiled:    {ms_ddp_compiled:.1f} ms/step")
+log0(f"Speedup: {ms_ddp_nocompile/ms_ddp_compiled:.2f}x ({ms_ddp_nocompile - ms_ddp_compiled:.1f}ms saved)")
+
+dist.destroy_process_group()
