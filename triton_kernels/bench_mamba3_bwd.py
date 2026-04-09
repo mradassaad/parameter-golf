@@ -2,24 +2,18 @@
 Benchmarks kernel fusion for mamba3 backward to ensure correctness and
 performance benefits.
 
-The stock kernel uses atomic_add reductions in several places, so two runs
-with identical inputs produce slightly different grads. We quantify that
-noise floor by saving two stock references and comparing them, then use a
-2x-noise-floor relative-L2 threshold to tell a real fusion bug apart from
-atomic-add jitter.
+The stock Triton bwd kernels are fully deterministic at our config (model
+weights seeded, no atomic_add jitter observed — noise floor is exactly 0),
+so --check uses a tight relative-L2 tolerance. Fusion typically introduces
+O(bf16 ULP) diffs from reordered fp ops, well below 1e-5.
 
 Usage:
-    # 1) Capture two independent stock references (same code, different runs)
-    python3 triton_kernels/bench_mamba3_bwd.py --save triton_kernels/ref_a.pt
-    python3 triton_kernels/bench_mamba3_bwd.py --save triton_kernels/ref_b.pt
+    # Capture a stock reference
+    python3 triton_kernels/bench_mamba3_bwd.py --save triton_kernels/ref.pt
 
-    # 2) Measure the noise floor (per-tensor relative L2 between the two refs)
-    python3 triton_kernels/bench_mamba3_bwd.py \
-        --noise-floor triton_kernels/ref_a.pt triton_kernels/ref_b.pt
-
-    # 3) Run the fused kernel and compare against one reference
+    # Run the fused kernel and compare
     MAMBA3_FUSED_BWD=1 python3 triton_kernels/bench_mamba3_bwd.py \
-        --check triton_kernels/ref_a.pt --l2-tol 0.05
+        --check triton_kernels/ref.pt
 """
 
 import os, sys
@@ -38,13 +32,10 @@ parser.add_argument("--save", type=str, default=None,
                     help="Save reference grads to this path (typically used with stock kernel)")
 parser.add_argument("--check", type=str, default=None,
                     help="Compare computed grads against reference at this path (relative L2)")
-parser.add_argument("--noise-floor", type=str, nargs=2, default=None,
-                    metavar=("REF_A", "REF_B"),
-                    help="Report per-tensor relative L2 between two stock references. "
-                         "Use two independent --save runs to quantify atomic_add jitter.")
-parser.add_argument("--l2-tol", type=float, default=0.05,
+parser.add_argument("--l2-tol", type=float, default=1e-5,
                     help="Relative L2 tolerance for --check (||g-r||/||r||). "
-                         "Rule of thumb: ~2x the noise floor from --noise-floor.")
+                         "Stock kernel is deterministic at our config (noise floor = 0), "
+                         "so 1e-5 flags any non-trivial numerical deviation.")
 parser.add_argument("--warmup", type=int, default=10)
 parser.add_argument("--iters", type=int, default=50)
 cli = parser.parse_args()
@@ -91,30 +82,6 @@ def compare_grad_dicts(got: dict, ref: dict, tol: float, label: str):
     return n_ok, n_fail, worst_rel, worst_name
 
 device = torch.device("cuda")
-
-# --- Noise-floor mode: compare two stock refs and exit, no model needed ---
-if cli.noise_floor is not None:
-    ref_a_path, ref_b_path = cli.noise_floor
-    ref_a = torch.load(ref_a_path, map_location=device)
-    ref_b = torch.load(ref_b_path, map_location=device)
-    print(f"Noise floor: {ref_a_path}  vs  {ref_b_path}")
-    print(f"{'tensor':<32} {'rel_l2':>10} {'max_abs':>12} {'shape'}")
-    worst = 0.0
-    worst_name = ""
-    for name in sorted(ref_a.keys()):
-        if name not in ref_b:
-            print(f"  MISSING in B: {name}")
-            continue
-        a, b = ref_a[name], ref_b[name]
-        rel = rel_l2(a, b)
-        diff = (a.float() - b.float()).abs().max().item()
-        print(f"{name:<32} {rel:>10.2e} {diff:>12.2e}  {tuple(a.shape)}")
-        if rel > worst:
-            worst, worst_name = rel, name
-    print()
-    print(f"Worst relative L2: {worst:.2e}  ({worst_name})")
-    print(f"Suggested --l2-tol for --check: {max(2*worst, 1e-4):.2e}")
-    sys.exit(0)
 
 args = Hyperparameters()
 torch.backends.cuda.matmul.allow_tf32 = True
