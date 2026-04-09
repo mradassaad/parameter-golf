@@ -122,6 +122,10 @@ torch.backends.cudnn.allow_tf32 = True
 
 # Build a Block then isolate the Mamba3Layer for clean perf attribution.
 # Block wraps Mamba3Layer + MLP + norms + residuals; we only want the Mamba3 backward.
+# Seed BEFORE construction so model weights are identical across runs — otherwise
+# --save runs produce uncorrelated grads (not atomic_add noise) and --check is meaningless.
+torch.manual_seed(1234)
+torch.cuda.manual_seed_all(1234)
 mamba_block = Block(
     args.model_dim, args.mlp_mult,
     args.mamba3_d_state, args.mamba3_expand,
