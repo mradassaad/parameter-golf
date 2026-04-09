@@ -95,6 +95,7 @@ class Hyperparameters:
     fp16_inproj_rows = bool(int(os.environ.get("FP16_INPROJ_ROWS", "1")))  # store recurrence rows in FP16 (0 = quantize all rows)
     target_mb = float(os.environ.get("TARGET_MB", "15.25"))  # target compressed submission size in MiB (16,000,000 bytes = 15.25 MiB)
     muon_eq_r = bool(int(os.environ.get("MUON_EQ_R", "0")))  # MuonEq-R: row-normalize before Newton-Schulz
+    tbptt_enabled = bool(int(os.environ.get("TBPTT_ENABLED", "0")))  # Truncated BPTT: persistent SSM state across steps
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -915,6 +916,97 @@ class DistributedTokenLoader:
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
 
+
+class DistributedStreamLoader:
+    """Truncated-BPTT loader with persistent per-stream cursors.
+
+    Splits the concatenated train stream into N = world_size * grad_accum_steps *
+    rows_per_slot contiguous segments and assigns one segment per stream. Each
+    (slot, row) on a rank walks its segment sequentially, advancing by seq_len
+    per next_batch call. All streams advance in lockstep (same step_in_epoch),
+    so wrap events are synchronized: when the cursor would run off the segment,
+    the loader resets all cursors to their segment starts and signals wrapped=True
+    so the training loop can reset SSM state.
+    """
+
+    def __init__(
+        self,
+        pattern: str,
+        rank: int,
+        world_size: int,
+        device: torch.device,
+        grad_accum_steps: int,
+        rows_per_slot: int,
+        seq_len: int,
+    ):
+        self.rank = rank
+        self.world_size = world_size
+        self.device = device
+        self.grad_accum_steps = grad_accum_steps
+        self.rows_per_slot = rows_per_slot
+        self.seq_len = seq_len
+
+        files = [Path(p) for p in sorted(glob.glob(pattern))]
+        if not files:
+            raise FileNotFoundError(f"No files found for pattern: {pattern}")
+        parts: list[Tensor] = []
+        skipped: list[str] = []
+        for f in files:
+            try:
+                parts.append(load_data_shard(f))
+            except (ValueError, OSError) as e:
+                skipped.append(f"{f.name}({e.__class__.__name__})")
+        if not parts:
+            raise FileNotFoundError(
+                f"No valid shards found for pattern: {pattern} (skipped {len(skipped)}: {skipped[:5]})"
+            )
+        if skipped and rank == 0:
+            print(f"tbptt: skipped {len(skipped)} corrupt shards: {skipped[:10]}")
+        self.tokens = torch.cat(parts)
+        total = int(self.tokens.numel())
+
+        n_streams = world_size * grad_accum_steps * rows_per_slot
+        self.seg_len = (total - 1) // n_streams
+        if self.seg_len < seq_len + 1:
+            raise RuntimeError(
+                f"TBPTT: segment too small ({self.seg_len}) for seq_len+1 ({seq_len+1}). "
+                f"total_tokens={total}, n_streams={n_streams}"
+            )
+        self.max_steps_per_epoch = (self.seg_len - 1) // seq_len
+
+        self.bases: list[list[int]] = []
+        for m in range(grad_accum_steps):
+            row_bases: list[int] = []
+            for b in range(rows_per_slot):
+                s = rank * grad_accum_steps * rows_per_slot + m * rows_per_slot + b
+                row_bases.append(s * self.seg_len)
+            self.bases.append(row_bases)
+
+        self.step_in_epoch = 0
+        self.epoch = 0
+
+    def next_batch(self, slot: int) -> tuple[Tensor, Tensor, bool]:
+        wrapped = False
+        if slot == 0 and self.step_in_epoch >= self.max_steps_per_epoch:
+            self.step_in_epoch = 0
+            self.epoch += 1
+            wrapped = True
+        L = self.seq_len
+        offset = self.step_in_epoch * L
+        xs: list[Tensor] = []
+        ys: list[Tensor] = []
+        for b in range(self.rows_per_slot):
+            pos = self.bases[slot][b] + offset
+            chunk = self.tokens[pos : pos + L + 1].to(dtype=torch.int64)
+            xs.append(chunk[:-1])
+            ys.append(chunk[1:])
+        x = torch.stack(xs).to(self.device, non_blocking=True)
+        y = torch.stack(ys).to(self.device, non_blocking=True)
+        if slot == self.grad_accum_steps - 1:
+            self.step_in_epoch += 1
+        return x, y, wrapped
+
+
 # -----------------------------
 # TRANSFORMER MODULES
 # -----------------------------
@@ -1386,8 +1478,13 @@ class GPT(nn.Module):
             x = self.smeargate(x)
         return F.rms_norm(x, (x.size(-1),))
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def forward(self, input_ids: Tensor, target_ids: Tensor,
+                layer_states: list | None = None, stateful: bool = False):
         x = self._embed(input_ids)
+        if stateful:
+            x, new_states = self._run_blocks_stateful(x, x, input_ids, layer_states)
+            loss = self._compute_logits_and_loss(x, target_ids)
+            return loss, new_states
         x = self._run_blocks(x, x, input_ids)
         return self._compute_logits_and_loss(x, target_ids)
 
@@ -1658,6 +1755,9 @@ def main() -> None:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
+        warmup_tbptt_states: list[list[tuple[Tensor, ...]] | None] | None = (
+            [None] * grad_accum_steps if args.tbptt_enabled else None
+        )
         for warmup_step in range(args.warmup_steps):
             zero_grad_all()
             for micro_step in range(grad_accum_steps):
@@ -1665,7 +1765,15 @@ def main() -> None:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    warmup_loss = model(x, y)
+                    if args.tbptt_enabled:
+                        assert warmup_tbptt_states is not None
+                        prev = warmup_tbptt_states[micro_step]
+                        warmup_loss, new_states = model(x, y, layer_states=prev, stateful=True)
+                        warmup_tbptt_states[micro_step] = [
+                            tuple(s.detach() for s in st) for st in new_states
+                        ]
+                    else:
+                        warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()
@@ -1679,6 +1787,28 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+
+    stream_loader: DistributedStreamLoader | None = None
+    tbptt_states: list[list[tuple[Tensor, ...]] | None] | None = None
+    if args.tbptt_enabled:
+        local_bsz = args.train_batch_tokens // (world_size * grad_accum_steps * args.train_seq_len)
+        if local_bsz <= 0:
+            raise RuntimeError(
+                f"TBPTT: local_bsz={local_bsz} must be positive. "
+                f"train_batch_tokens={args.train_batch_tokens}, world_size={world_size}, "
+                f"grad_accum_steps={grad_accum_steps}, train_seq_len={args.train_seq_len}"
+            )
+        stream_loader = DistributedStreamLoader(
+            args.train_files, rank, world_size, device,
+            grad_accum_steps=grad_accum_steps,
+            rows_per_slot=local_bsz,
+            seq_len=args.train_seq_len,
+        )
+        tbptt_states = [None] * grad_accum_steps
+        log0(
+            f"tbptt:enabled local_bsz={local_bsz} n_streams={world_size * grad_accum_steps * local_bsz} "
+            f"seg_len={stream_loader.seg_len} max_steps_per_epoch={stream_loader.max_steps_per_epoch}"
+        )
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
@@ -1746,11 +1876,27 @@ def main() -> None:
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-            x, y = train_loader.next_batch(args.train_batch_tokens, cur_seq_len, grad_accum_steps)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y)
-            train_loss += loss.detach()
-            (loss * grad_scale).backward()
+            if args.tbptt_enabled:
+                assert stream_loader is not None and tbptt_states is not None
+                x, y, wrapped = stream_loader.next_batch(micro_step)
+                if wrapped:
+                    # All streams hit end-of-segment simultaneously; drop carried state.
+                    tbptt_states = [None] * grad_accum_steps
+                    log0(f"tbptt:wrap step={step} epoch={stream_loader.epoch}")
+                layer_states = tbptt_states[micro_step]
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    loss, new_states = model(x, y, layer_states=layer_states, stateful=True)
+                train_loss += loss.detach()
+                (loss * grad_scale).backward()
+                tbptt_states[micro_step] = [
+                    tuple(s.detach() for s in st) for st in new_states
+                ]
+            else:
+                x, y = train_loader.next_batch(args.train_batch_tokens, cur_seq_len, grad_accum_steps)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    loss = model(x, y)
+                train_loss += loss.detach()
+                (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
