@@ -576,7 +576,14 @@ def _quantize_with_clip(t32: Tensor, clip_abs: Tensor | float, qmax: Tensor | in
         qmax_col = qmax[:, None] if isinstance(qmax, Tensor) else qmax
         clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
         scale = (clip_abs / (qmax.float() if isinstance(qmax, Tensor) else float(qmax)))
-        scale = scale.clamp_min(1.0 / 127)
+        # Per-row scale floor must match the per-row bit width. 1/qmax = smallest scale
+        # such that the minimum nonzero quantized magnitude (±1 * scale) ≈ 1/qmax range.
+        # Using a uniform 1/127 floor (INT8) was a bug: it let INT6 rows use scales ~4× too
+        # small, inflating quantized magnitudes and defeating selective ±1 pruning.
+        if isinstance(qmax, Tensor):
+            scale = torch.maximum(scale, 1.0 / qmax.float())
+        else:
+            scale = scale.clamp_min(1.0 / float(qmax))
         q_unclamped = torch.round(clipped / scale[:, None])
         if isinstance(qmax_col, Tensor):
             qmax_f = qmax_col.float()
