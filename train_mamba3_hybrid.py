@@ -1167,8 +1167,13 @@ class Mamba3Layer(nn.Module):
                 CastedLinear(in_features, in_proj_rank, bias=False),
                 CastedLinear(in_proj_rank, out_features, bias=has_bias),
             )
+            # Variance-preserving init: product W_up @ W_down should have variance
+            # matching a single Kaiming-init dense layer (2/in_features).
+            # var(product) = rank * σ_d^2 * σ_u^2 = 2/in_features when σ_d=sqrt(2/in_features),
+            # σ_u = sqrt(1/rank). Prevents the ~2× magnitude inflation at step 0 that costs
+            # ~25 mBPB early training (observed 2026-04-17 run with wrong init).
             nn.init.normal_(self.mamba3.in_proj[0].weight, std=(2.0 / in_features) ** 0.5)
-            nn.init.normal_(self.mamba3.in_proj[1].weight, std=(2.0 / in_proj_rank) ** 0.5)
+            nn.init.normal_(self.mamba3.in_proj[1].weight, std=(1.0 / in_proj_rank) ** 0.5)
             if has_bias:
                 nn.init.zeros_(self.mamba3.in_proj[1].bias)
         else:
