@@ -1246,12 +1246,6 @@ class MLP(nn.Module):
         x = F.leaky_relu(self.fc(x), negative_slope=0.5)
         return self.proj(x.square())
 
-    def forward(self, token_ids: Tensor) -> Tensor:
-        h = self.embed(token_ids)
-        if self.proj is not None:
-            h = self.proj(h)
-        return h * self.scale.to(dtype=h.dtype)
-
 
 class Block(nn.Module):
     def __init__(
