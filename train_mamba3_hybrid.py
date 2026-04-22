@@ -1,8 +1,16 @@
 """Mamba-3 Hybrid for Parameter Golf.
 
-Mostly Mamba-3 SSD blocks with a few standalone attention layers (Mamba-2 paper
-Section 9.2.3: ~10% attention optimal at scale; higher ratio may help at our
-small model size). Env-var-driven hyperparameter sweep.
+Sequential hybrid: Mamba-3 SSD blocks + a small number of standalone attention
+layers (~2 attention + 5 SSM is our best-measured config at SP8192 7L). Env-var
+driven; see `Hyperparameters` for all knobs.
+
+Feature surface in this file is the banked submission only. Many ideas were
+tested and *removed* because they underperformed or required structural
+changes unsuitable for an SSM at 25M / 10min / 16MB. Full list with verdicts
+and the three structural findings (SSM LZMA penalty, Muon-SSM discordance,
+SP4096 → SP8192 non-transfer) are documented in
+`docs/ssm_structural_findings_writeup.md`. Git history holds the removed code
+on commits prior to the cleanup.
 """
 
 from __future__ import annotations
@@ -20,12 +28,6 @@ import uuid
 import lzma
 import zlib
 from pathlib import Path
-
-try:
-    import zstandard as zstd
-    HAS_ZSTD = True
-except ImportError:
-    HAS_ZSTD = False
 
 import numpy as np
 import sentencepiece as spm
@@ -62,10 +64,6 @@ class Hyperparameters:
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 1_048_576))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 4096))
-    attn_seq_len = int(os.environ.get("ATTN_SEQ_LEN", 0))  # windowed attention (0 = same as train_seq_len)
-    # Progressive context: start short (fast steps), ramp to full train_seq_len.
-    # Format: "frac1:len1,frac2:len2" e.g. "0.3:1024,0.6:2048" means 0-30% at 1024, 30-60% at 2048, rest at train_seq_len
-    progressive_ctx = os.environ.get("PROGRESSIVE_CTX", "")  # empty = disabled
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     sweep_mode = bool(int(os.environ.get("SWEEP_MODE", "0")))  # skip post-training (quant, serialize, TTT)
 
@@ -84,46 +82,23 @@ class Hyperparameters:
     ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
 
     # Quantization.
-    quant_bits = int(os.environ.get("QUANT_BITS", 6))  # quantization bit width for attention (6 or 8)
-    quant_bits_mlp = int(os.environ.get("QUANT_BITS_MLP", 0))  # MLP bit width (0 = same as quant_bits)
-    quant_bits_embed = int(os.environ.get("QUANT_BITS_EMBED", 0))  # embedding bit width (0 = same as quant_bits, SOTA: 8)
+    quant_bits = int(os.environ.get("QUANT_BITS", 6))
+    quant_bits_embed = int(os.environ.get("QUANT_BITS_EMBED", 0))  # 0 = same as quant_bits
     # Mixed-precision SSM: dd_A and dd_dt rows of mamba3.in_proj.weight at higher bits.
-    # A/dt errors compound through the recurrence (Q-Mamba ICLR 2025: uniform 6-bit collapses
-    # Mamba ppl 5.5→21+). Only ~32 rows per SSM block — cheap to protect. 0 = same as quant_bits.
-    # Default=8 (free quality win validated 2026-04-17 ablation: −0.8 mBPB for +0.01 MiB).
+    # A/dt errors compound through the recurrence; only ~32 rows per SSM block, cheap to protect.
     quant_bits_ssm_dynamics = int(os.environ.get("QUANT_BITS_SSM_DYNAMICS", 8))
-    gptq_clip_sigmas = float(os.environ.get("GPTQ_CLIP_SIGMAS", 0))  # SDClip for matrices (0 = percentile search, SOTA: 12.85)
-    gptq_embed_clip_sigmas = float(os.environ.get("GPTQ_EMBED_CLIP_SIGMAS", 0))  # SDClip for embeddings (0 = same as matrices, SOTA: 20)
-    qat_start_frac = float(os.environ.get("QAT_START_FRAC", 0.0))  # QAT: start at this fraction of training (0 = disabled)
-    gptq_lite = bool(int(os.environ.get("GPTQ_LITE", "1")))  # search for optimal clip percentile per tensor
-    use_zstd = bool(int(os.environ.get("USE_ZSTD", "1")))  # use zstd instead of zlib
-    use_lzma = bool(int(os.environ.get("USE_LZMA", "0")))  # use lzma instead of zlib (better ratio, slower)
-    use_brotli = bool(int(os.environ.get("USE_BROTLI", "0")))  # use brotli (SOTA uses quality=11)
-    eval_temp = float(os.environ.get("EVAL_TEMP", "1.0"))  # temperature scaling at eval (T<1 sharpens, improves bpb)
-    use_gptq = bool(int(os.environ.get("USE_GPTQ", "0")))  # Full Hessian GPTQ instead of per-row min-max
-    gptq_num_seqs = int(os.environ.get("GPTQ_NUM_SEQS", "32"))    # AR self-gen sequences for Hessian collection
-    gptq_gen_len = int(os.environ.get("GPTQ_GEN_LEN", "4096"))   # tokens per generated sequence (match train_seq_len)
-    gptq_gen_temp = float(os.environ.get("GPTQ_GEN_TEMP", "0.8"))  # sampling temperature during generation
-    gptq_damp = float(os.environ.get("GPTQ_DAMP", "0.01"))  # Hessian damping factor (λI added for stability)
-    late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", "0.0"))  # enable QAT when lr_mul drops below this (SOTA uses 0.15)
-    target_mb = float(os.environ.get("TARGET_MB", "15.25"))  # target compressed submission size in MiB (16,000,000 bytes = 15.25 MiB)
-    muon_eq_r = bool(int(os.environ.get("MUON_EQ_R", "0")))  # MuonEq-R: row-normalize before Newton-Schulz
-
+    gptq_lite = bool(int(os.environ.get("GPTQ_LITE", "1")))  # search optimal clip percentile per tensor
+    use_lzma = bool(int(os.environ.get("USE_LZMA", "1")))
+    eval_temp = float(os.environ.get("EVAL_TEMP", "1.0"))
+    use_gptq = bool(int(os.environ.get("USE_GPTQ", "0")))
+    gptq_num_seqs = int(os.environ.get("GPTQ_NUM_SEQS", "32"))
+    late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", "0.0"))
+    target_mb = float(os.environ.get("TARGET_MB", "15.25"))  # target compressed size in MiB
+    muon_eq_r = bool(int(os.environ.get("MUON_EQ_R", "0")))  # row-normalize before Newton-Schulz
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 8))  # unique (physical) layers
-
-    # Layer loop (depth recurrence): repeat a block of layers for free effective depth.
-    num_loops = int(os.environ.get("NUM_LOOPS", 0))  # 0 = disabled, 2 = repeat loop segment twice
-    loop_start = int(os.environ.get("LOOP_START", 3))  # first layer in loop segment
-    loop_end = int(os.environ.get("LOOP_END", 4))  # last layer in loop segment (inclusive)
-    enable_looping_at = float(os.environ.get("ENABLE_LOOPING_AT", 0.35))  # fraction of training before activating loop
-
-    # BigramHash.
-    use_bigram_hash = bool(int(os.environ.get("USE_BIGRAM_HASH", "1")))
-    bigram_buckets = int(os.environ.get("BIGRAM_BUCKETS", 4096))
-    bigram_hash_dim = int(os.environ.get("BIGRAM_HASH_DIM", 128))
+    num_layers = int(os.environ.get("NUM_LAYERS", 8))
 
     # OrthoInit + SWA.
     use_ortho_init = bool(int(os.environ.get("USE_ORTHO_INIT", "1")))
@@ -138,19 +113,12 @@ class Hyperparameters:
     mamba3_chunk_size = int(os.environ.get("MAMBA3_CHUNK_SIZE", 64))
     mamba3_ngroups = int(os.environ.get("MAMBA3_NGROUPS", 1))
     mamba3_rope_fraction = float(os.environ.get("MAMBA3_ROPE_FRACTION", 0.5))
-    mamba3_outproj_norm = bool(int(os.environ.get("MAMBA3_OUTPROJ_NORM", "0")))
-    # Low-rank in_proj factorization: 0 = dense (original), >0 = factor as (d→rank→out)
-    # Mamba-3 in_proj is (d=512 → 2232) = 1.14M params/block; rank=128 → 351K params/block.
-    # Enables ≤16MB submission at 7L 6-SSM configs. Throughput cost ~3-5% from extra matmul.
-    mamba3_in_proj_rank = int(os.environ.get("IN_PROJ_RANK", 0))
     # Attention layers (evenly spaced among SSD layers).
     num_attn_layers = int(os.environ.get("NUM_ATTN_LAYERS", 1))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
-    ve_enabled = bool(int(os.environ.get("VE_ENABLED", "0")))
-    ve_dim = int(os.environ.get("VE_DIM", 64))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
@@ -514,7 +482,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "m3_scale,mlp_scale,mlp_scales,attn_scale,resid_mix,resid_mixes,skip_weight,skip_weights,dt_bias,B_bias,C_bias,.D,A_log,q_gain,ve_layer_scales,ve_shared.scale",
+        "m3_scale,mlp_scale,attn_scale,resid_mix,skip_weight,skip_weights,dt_bias,B_bias,C_bias,.D,A_log,q_gain",
     ).split(",")
     if pattern
 )
@@ -775,11 +743,9 @@ def collect_hessians_from_train_data(
 
 def quantize_int6_gptq(
     weight: Tensor, hessian: Tensor | None = None, clip_range: int | Tensor = 31, block_size: int = 128,
-    clip_sigmas: float = 0.0,
 ) -> tuple[Tensor, Tensor]:
     """Full GPTQ: Hessian-aware int6 quantization with Cholesky error compensation and column reordering.
-    If clip_sigmas > 0, uses SDClip (std-deviation-based clipping like SOTA) instead of percentile search.
-    Falls back to percentile search if hessian is None (same as existing gptq_lite path).
+    Falls back to percentile search if hessian is None.
     clip_range may be a per-row tensor of shape (rows,) for mixed-precision quantization."""
     t32 = weight.float()
     if t32.ndim != 2 or hessian is None:
@@ -852,25 +818,16 @@ def quantize_int6_gptq(
             return torch.maximum(raw, cr_min).to(torch.float16)
         return raw.clamp_min(cr_min).to(torch.float16)
 
-    if clip_sigmas > 0:
-        # SDClip: scale = clip_sigmas * row_std / clip_range (SOTA approach)
-        row_std = t32.std(dim=1)
-        raw = (clip_sigmas * row_std) / cr_1d if cr_is_tensor else (clip_sigmas * row_std) / cr_1d
-        s = raw.clamp_min(1e-10).to(torch.float16)
-        Q, _ = _gptq_sweep(s)
-        Q = Q[:, inv_perm]
-        return Q, s
-    else:
-        # Percentile search (original approach)
-        best_q, best_scale, best_err = None, None, float("inf")
-        for pct in [0.9990, 0.9995, 0.9999, 0.99999, 1.0]:
-            row_clip = torch.quantile(t32.abs(), pct, dim=1) if pct < 1.0 else t32.abs().amax(dim=1)
-            s = _scale_from_row_clip(row_clip)
-            Q, mse = _gptq_sweep(s)
-            if mse < best_err:
-                best_q, best_scale, best_err = Q, s, mse
-        best_q = best_q[:, inv_perm]
-        return best_q, best_scale
+    # Percentile search: pick the row-wise clip percentile that minimizes MSE.
+    best_q, best_scale, best_err = None, None, float("inf")
+    for pct in [0.9990, 0.9995, 0.9999, 0.99999, 1.0]:
+        row_clip = torch.quantile(t32.abs(), pct, dim=1) if pct < 1.0 else t32.abs().amax(dim=1)
+        s = _scale_from_row_clip(row_clip)
+        Q, mse = _gptq_sweep(s)
+        if mse < best_err:
+            best_q, best_scale, best_err = Q, s, mse
+    best_q = best_q[:, inv_perm]
+    return best_q, best_scale
 
 
 def _quantize_int6_percentile(t32: Tensor, clip_range: int | Tensor = 31) -> tuple[Tensor, Tensor]:
@@ -903,7 +860,7 @@ def _quantize_int6_percentile(t32: Tensor, clip_range: int | Tensor = 31) -> tup
 
 
 def quantize_state_dict_int8(
-    state_dict: dict[str, Tensor], quant_bits: int = 8, quant_bits_mlp: int = 0,
+    state_dict: dict[str, Tensor], quant_bits: int = 8,
     quant_bits_embed: int = 0, search_clip: bool = False,
     quant_bits_ssm_dynamics: int = 0, ssm_cfg: dict | None = None,
 ):
@@ -940,8 +897,6 @@ def quantize_state_dict_int8(
         bits: int | Tensor = quant_bits
         if quant_bits_embed > 0 and "tok_emb" in name:
             bits = quant_bits_embed
-        elif quant_bits_mlp > 0 and "mlp" in name:
-            bits = quant_bits_mlp
         # Mixed-precision in_proj: promote dd_A + dd_dt rows to higher bits.
         if quant_bits_ssm_dynamics > 0 and ssm_cfg is not None and t.ndim == 2:
             dyn_mask = compute_ssm_dynamics_row_mask(name, t.shape[0], ssm_cfg)
@@ -1105,23 +1060,6 @@ class CastedLinear(nn.Linear):
         return F.linear(x, w, bias)
 
 
-class BigramHash(nn.Module):
-    def __init__(self, num_buckets: int, hash_dim: int, model_dim: int):
-        super().__init__()
-        self.num_buckets = num_buckets
-        self.table = nn.Embedding(num_buckets, hash_dim)
-        self.proj = CastedLinear(hash_dim, model_dim, bias=False)
-        self.proj._zero_init = True
-        nn.init.normal_(self.table.weight, std=0.01)
-
-    def forward(self, input_ids: Tensor) -> Tensor:
-        bsz, seqlen = input_ids.shape
-        prev_ids = torch.cat([torch.zeros(bsz, 1, dtype=input_ids.dtype, device=input_ids.device),
-                              input_ids[:, :-1]], dim=1)
-        h = ((prev_ids.long() * 92821 + input_ids.long()) % self.num_buckets).long()
-        return self.proj(self.table(h))
-
-
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     with torch.no_grad():
         for name, param in module.named_parameters():
@@ -1142,54 +1080,26 @@ def _mamba3_ssd_kernel(Q, K, V, ADT, DT, Trap, Q_bias, K_bias, Angles, D, Z,
 
 
 class Mamba3Layer(nn.Module):
-    """Pure Mamba-3 SISO layer. Uses the Mamba3 module directly."""
+    """Pure Mamba-3 SISO layer. Wraps upstream Mamba3 with CastedLinear projections
+    so QAT fake-quant and fp32 master weights apply to the outlier-heavy projections."""
     def __init__(self, dim: int, d_state: int = 64, expand: float = 2,
                  headdim: int = 64, chunk_size: int = 64,
-                 ngroups: int = 1, rope_fraction: float = 0.5,
-                 is_outproj_norm: bool = False, in_proj_rank: int = 0):
+                 ngroups: int = 1, rope_fraction: float = 0.5):
         super().__init__()
         from mamba_ssm.modules.mamba3 import Mamba3
         self.mamba3 = Mamba3(
             d_model=dim, d_state=d_state, expand=expand,
             headdim=headdim, is_mimo=False, chunk_size=chunk_size,
             ngroups=ngroups, rope_fraction=rope_fraction,
-            is_outproj_norm=is_outproj_norm,
+            is_outproj_norm=False,
         )
-        # out_proj always dense (smaller matrix, less redundancy). CastedLinear applies QAT
-        # and fp32 master weights to outlier-heavy projections.
-        src_out = self.mamba3.out_proj
-        dst_out = CastedLinear(src_out.in_features, src_out.out_features, bias=src_out.bias is not None)
-        dst_out.weight = src_out.weight
-        if src_out.bias is not None:
-            dst_out.bias = src_out.bias
-        self.mamba3.out_proj = dst_out
-
-        if in_proj_rank > 0:
-            # Low-rank factorization: in_proj (d→out) = (d→rank) @ (rank→out).
-            # Sequential preserves the `m.in_proj(x)` call site. GPTQ hooks fire per-CastedLinear.
-            src = self.mamba3.in_proj
-            in_features, out_features = src.in_features, src.out_features
-            has_bias = src.bias is not None
-            self.mamba3.in_proj = nn.Sequential(
-                CastedLinear(in_features, in_proj_rank, bias=False),
-                CastedLinear(in_proj_rank, out_features, bias=has_bias),
-            )
-            # Variance-preserving init: product W_up @ W_down should have variance
-            # matching a single Kaiming-init dense layer (2/in_features).
-            # var(product) = rank * σ_d^2 * σ_u^2 = 2/in_features when σ_d=sqrt(2/in_features),
-            # σ_u = sqrt(1/rank). Prevents the ~2× magnitude inflation at step 0 that costs
-            # ~25 mBPB early training (observed 2026-04-17 run with wrong init).
-            nn.init.normal_(self.mamba3.in_proj[0].weight, std=(2.0 / in_features) ** 0.5)
-            nn.init.normal_(self.mamba3.in_proj[1].weight, std=(1.0 / in_proj_rank) ** 0.5)
-            if has_bias:
-                nn.init.zeros_(self.mamba3.in_proj[1].bias)
-        else:
-            src = self.mamba3.in_proj
+        for attr in ("in_proj", "out_proj"):
+            src = getattr(self.mamba3, attr)
             dst = CastedLinear(src.in_features, src.out_features, bias=src.bias is not None)
             dst.weight = src.weight
             if src.bias is not None:
                 dst.bias = src.bias
-            self.mamba3.in_proj = dst
+            setattr(self.mamba3, attr, dst)
 
     def _pre_ssd(self, x):
         """Pre-SSD ops: in_proj, split, reshape, compute ADT/DT, norms."""
@@ -1219,16 +1129,11 @@ class Mamba3Layer(nn.Module):
         C = m.C_norm(C).squeeze(2)
         return z, xv, B, C, ADT, DT, trap, angles
 
-    def _post_ssd(self, y, z):
-        """Post-SSD ops: reshape, optional norm, out_proj."""
+    def _post_ssd(self, y):
         from einops import rearrange
         m = self.mamba3
         y = rearrange(y, "b l h p -> b l (h p)")
-        if m.is_outproj_norm:
-            z_flat = rearrange(z, "b l h p -> b l (h p)")
-            y = m.outproj_rmsnorm(y) * (z_flat * F.silu(z_flat))
-        y = m.out_proj(y)
-        return y
+        return m.out_proj(y)
 
     def forward(self, x: Tensor) -> Tensor:
         m = self.mamba3
@@ -1238,10 +1143,10 @@ class Mamba3Layer(nn.Module):
             ADT=ADT, DT=DT, Trap=trap,
             Q_bias=m.C_bias.squeeze(1), K_bias=m.B_bias.squeeze(1),
             Angles=angles, D=m.D,
-            Z=z if not m.is_outproj_norm else None,
+            Z=z,
             chunk_size=m.chunk_size,
         )
-        return self._post_ssd(y, z)
+        return self._post_ssd(y)
 
     def forward_stateful(self, x: Tensor, input_states=None):
         """Forward with SSM state carry. Returns (output, final_states)."""
@@ -1252,14 +1157,14 @@ class Mamba3Layer(nn.Module):
             ADT=ADT, DT=DT, Trap=trap,
             Q_bias=m.C_bias.squeeze(1), K_bias=m.B_bias.squeeze(1),
             Angles=angles, D=m.D,
-            Z=z if not m.is_outproj_norm else None,
+            Z=z,
             chunk_size=m.chunk_size,
             Input_States=input_states,
             return_final_states=True,
         )
-        y, last_angle, last_state, last_k, last_v, *rest = result
+        y, last_angle, last_state, last_k, last_v, *_rest = result
         final_states = (last_angle, last_state, last_k, last_v)
-        return self._post_ssd(y, z), final_states
+        return self._post_ssd(y), final_states
 
 
 class Rotary(nn.Module):
@@ -1293,10 +1198,7 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
 
 
 class AttentionLayer(nn.Module):
-    """Standalone causal self-attention with GQA and RoPE.
-    Supports windowed attention: if window_size > 0 and seqlen > window_size,
-    splits input into non-overlapping windows, applies causal attention within each.
-    SSM layers provide cross-window context via recurrent state."""
+    """Causal self-attention with GQA and RoPE. QK-norm + per-head q_gain."""
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int,
                  rope_base: float, qk_gain_init: float):
         super().__init__()
@@ -1304,7 +1206,6 @@ class AttentionLayer(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.head_dim = dim // num_heads
         kv_dim = num_kv_heads * self.head_dim
-        self.window_size = 0  # 0 = full attention, set via args.attn_seq_len
 
         self.c_q = CastedLinear(dim, dim, bias=False)
         self.c_k = CastedLinear(dim, kv_dim, bias=False)
@@ -1314,15 +1215,11 @@ class AttentionLayer(nn.Module):
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
 
-    def _attn_core(self, x: Tensor, v_embed: Tensor | None) -> Tensor:
-        """Full causal attention on a single (possibly windowed) sequence."""
+    def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
-        if v_embed is not None:
-            v = v + v_embed.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
-        v = v.transpose(1, 2)
+        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = v * v.sigmoid()
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
@@ -1335,20 +1232,6 @@ class AttentionLayer(nn.Module):
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
         return self.proj(y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim))
-
-    def forward(self, x: Tensor, v_embed: Tensor | None = None) -> Tensor:
-        bsz, seqlen, dim = x.shape
-        w = self.window_size
-        if w <= 0 or seqlen <= w:
-            return self._attn_core(x, v_embed)
-        # Windowed attention: reshape into windows, process each independently.
-        # Fold batch and window dimensions so each window is a separate "batch item".
-        n_windows = seqlen // w
-        assert seqlen % w == 0, f"seqlen {seqlen} not divisible by window_size {w}"
-        x_win = x.reshape(bsz * n_windows, w, dim)
-        ve_win = v_embed.reshape(bsz * n_windows, w, -1) if v_embed is not None else None
-        out_win = self._attn_core(x_win, ve_win)
-        return out_win.reshape(bsz, seqlen, dim)
 
 
 class MLP(nn.Module):
@@ -1363,18 +1246,6 @@ class MLP(nn.Module):
         x = F.leaky_relu(self.fc(x), negative_slope=0.5)
         return self.proj(x.square())
 
-
-class ValueEmbedding(nn.Module):
-    """Reinject token identity into attention values. Shared table across all attn layers."""
-    def __init__(self, vocab_size: int, ve_dim: int, kv_dim: int):
-        super().__init__()
-        self.embed = nn.Embedding(vocab_size, ve_dim)
-        nn.init.normal_(self.embed.weight, std=0.01)
-        self.proj = CastedLinear(ve_dim, kv_dim, bias=False) if ve_dim != kv_dim else None
-        if self.proj is not None:
-            nn.init.zeros_(self.proj.weight)
-        self.scale = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
-
     def forward(self, token_ids: Tensor) -> Tensor:
         h = self.embed(token_ids)
         if self.proj is not None:
@@ -1388,7 +1259,6 @@ class Block(nn.Module):
         mamba3_d_state: int = 64, mamba3_expand: float = 2,
         mamba3_headdim: int = 64, mamba3_chunk_size: int = 64,
         mamba3_ngroups: int = 1, mamba3_rope_fraction: float = 0.5,
-        mamba3_outproj_norm: bool = False, mamba3_in_proj_rank: int = 0,
         layer_idx: int = 0,
     ):
         super().__init__()
@@ -1398,14 +1268,13 @@ class Block(nn.Module):
             dim, d_state=mamba3_d_state, expand=mamba3_expand,
             headdim=mamba3_headdim, chunk_size=mamba3_chunk_size,
             ngroups=mamba3_ngroups, rope_fraction=mamba3_rope_fraction,
-            is_outproj_norm=mamba3_outproj_norm, in_proj_rank=mamba3_in_proj_rank,
         )
         self.mlp = MLP(dim, mlp_mult)
         self.m3_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-    def forward(self, x: Tensor, x0: Tensor, v_embed: Tensor | None = None) -> Tensor:
+    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         m3_out = self.mamba3(self.m3_norm(x))
@@ -1413,7 +1282,7 @@ class Block(nn.Module):
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
-    def forward_stateful(self, x: Tensor, x0: Tensor, v_embed: Tensor | None = None, ssm_states=None):
+    def forward_stateful(self, x: Tensor, x0: Tensor, ssm_states=None):
         """Forward with SSM state carry. Returns (output, final_states)."""
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
@@ -1440,10 +1309,10 @@ class AttnBlock(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-    def forward(self, x: Tensor, x0: Tensor, v_embed: Tensor | None = None) -> Tensor:
+    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x), v_embed=v_embed)
+        attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
@@ -1454,18 +1323,12 @@ class GPT(nn.Module):
         self, vocab_size: int, num_layers: int, model_dim: int,
         mlp_mult: int, tie_embeddings: bool, tied_embed_init_std: float,
         logit_softcap: float,
-        use_bigram_hash: bool = False,
-        bigram_buckets: int = 4096, bigram_hash_dim: int = 128,
         use_ortho_init: bool = False,
         mamba3_d_state: int = 64, mamba3_expand: float = 2,
         mamba3_headdim: int = 64, mamba3_chunk_size: int = 64,
         mamba3_ngroups: int = 1, mamba3_rope_fraction: float = 0.5,
-        mamba3_outproj_norm: bool = False, mamba3_in_proj_rank: int = 0,
         num_attn_layers: int = 1, num_heads: int = 8, num_kv_heads: int = 4,
         rope_base: float = 10000.0, qk_gain_init: float = 1.0,
-        ve_enabled: bool = False, ve_dim: int = 64,
-        num_loops: int = 0, loop_start: int = 3, loop_end: int = 4,
-        attn_window: int = 0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1476,43 +1339,16 @@ class GPT(nn.Module):
         self.use_ortho_init = use_ortho_init
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
 
-        self.bigram_hash = BigramHash(bigram_buckets, bigram_hash_dim, model_dim) if use_bigram_hash else None
-
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-
         self.skip_weights = nn.Parameter(
             torch.ones(1, self.num_skip_weights, model_dim, dtype=torch.float32)
         )
+        self.encoder_indices = list(range(self.num_encoder_layers))
+        self.decoder_indices = list(range(self.num_encoder_layers, num_layers))
 
-        # Layer loop (depth recurrence): build flat index sequences for encoder/decoder.
-        # When looping_active=True, _run_blocks uses the expanded indices.
-        # Physical blocks are reused — no extra params.
-        self.num_loops = num_loops
-        self.looping_active = False
-        if num_loops > 0:
-            loop_seg = list(range(loop_start, loop_end + 1))
-            all_indices = list(range(loop_start))  # layers before loop
-            for _ in range(num_loops + 1):  # original + repeats
-                all_indices.extend(loop_seg)
-            all_indices.extend(range(loop_end + 1, num_layers))  # layers after loop
-            num_enc = len(all_indices) // 2
-            self.encoder_indices = all_indices[:num_enc]
-            self.decoder_indices = all_indices[num_enc:]
-            # Size skip_weights for the larger (looped) case so all params are always used
-            self.num_skip_weights = max(
-                self.num_skip_weights,
-                min(len(self.encoder_indices), len(self.decoder_indices)),
-            )
-            self.skip_weights = nn.Parameter(
-                torch.ones(1, self.num_skip_weights, model_dim, dtype=torch.float32)
-            )
-        else:
-            self.encoder_indices = list(range(self.num_encoder_layers))
-            self.decoder_indices = list(range(self.num_encoder_layers, num_layers))
-
-        # Compute evenly spaced attention layer indices
+        # Evenly-spaced attention layer indices among SSM layers.
         attn_indices = set()
         if num_attn_layers > 0:
             for i in range(1, num_attn_layers + 1):
@@ -1534,24 +1370,8 @@ class GPT(nn.Module):
                     mamba3_d_state=mamba3_d_state, mamba3_expand=mamba3_expand,
                     mamba3_headdim=mamba3_headdim, mamba3_chunk_size=mamba3_chunk_size,
                     mamba3_ngroups=mamba3_ngroups, mamba3_rope_fraction=mamba3_rope_fraction,
-                    mamba3_outproj_norm=mamba3_outproj_norm,
-                    mamba3_in_proj_rank=mamba3_in_proj_rank,
                     layer_idx=i,
                 ))
-
-        if attn_window > 0:
-            for i in self.attn_indices:
-                self.blocks[i].attn.window_size = attn_window
-
-        kv_dim = num_kv_heads * (model_dim // num_heads)
-        if ve_enabled and self.attn_indices:
-            self.ve_shared = ValueEmbedding(vocab_size, ve_dim, kv_dim)
-            self.ve_layer_scales = nn.ParameterList(
-                [nn.Parameter(torch.ones(1, dtype=torch.float32)) for _ in self.attn_indices]
-            )
-        else:
-            self.ve_shared = None
-            self.ve_layer_scales = nn.ParameterList()
 
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
@@ -1585,12 +1405,6 @@ class GPT(nn.Module):
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
-    def _get_ve(self, block_idx: int, ve_cache: Tensor | None) -> Tensor | None:
-        if ve_cache is None or block_idx not in self.attn_indices:
-            return None
-        ve_idx = self.attn_indices.index(block_idx)
-        return ve_cache * self.ve_layer_scales[ve_idx].to(dtype=ve_cache.dtype)
-
     _embed_qat_bits: int = 0
 
     def _embed(self, input_ids: Tensor) -> Tensor:
@@ -1599,71 +1413,59 @@ class GPT(nn.Module):
             x = F.embedding(input_ids, w)
         else:
             x = self.tok_emb(input_ids)
-        if self.bigram_hash is not None:
-            x = x + self.bigram_hash(input_ids)
         return F.rms_norm(x, (x.size(-1),))
 
     def forward(self, input_ids: Tensor, target_ids: Tensor,
                 layer_states: list | None = None, stateful: bool = False):
         x = self._embed(input_ids)
         if stateful:
-            x, new_states = self._run_blocks_stateful(x, x, input_ids, layer_states)
+            x, new_states = self._run_blocks_stateful(x, x, layer_states)
             loss = self._compute_logits_and_loss(x, target_ids)
             return loss, new_states
-        x = self._run_blocks(x, x, input_ids)
+        x = self._run_blocks(x, x)
         return self._compute_logits_and_loss(x, target_ids)
 
-    def _run_blocks(self, x: Tensor, x0: Tensor, input_ids: Tensor | None = None) -> Tensor:
-        ve_cache = self.ve_shared(input_ids) if (self.ve_shared is not None and input_ids is not None) else None
-        if self.looping_active:
-            enc_idx, dec_idx = self.encoder_indices, self.decoder_indices
-        else:
-            enc_idx = list(range(self.num_encoder_layers))
-            dec_idx = list(range(self.num_encoder_layers, len(self.blocks)))
+    def _run_blocks(self, x: Tensor, x0: Tensor) -> Tensor:
+        enc_idx = list(range(self.num_encoder_layers))
+        dec_idx = list(range(self.num_encoder_layers, len(self.blocks)))
         skips: list[Tensor] = []
         for bi in enc_idx:
-            x = self.blocks[bi](x, x0, v_embed=self._get_ve(bi, ve_cache))
+            x = self.blocks[bi](x, x0)
             skips.append(x)
         for i, bi in enumerate(dec_idx):
             if i < len(skips) and i < self.skip_weights.shape[1]:
                 x = x + self.skip_weights[0, i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             elif skips:
-                skips.pop()  # discard if more skips than weights
-            x = self.blocks[bi](x, x0, v_embed=self._get_ve(bi, ve_cache))
+                skips.pop()
+            x = self.blocks[bi](x, x0)
         return x
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         bsz, seqlen = input_ids.shape
         x = self._embed(input_ids)
-        x = self._run_blocks(x, x, input_ids)
+        x = self._run_blocks(x, x)
         x = self.final_norm(x).reshape(-1, x.size(-1))
         w = self.tok_emb.weight if self.tie_embeddings else self.lm_head.weight
         logits = self.logit_softcap * torch.tanh(F.linear(x, w) / self.logit_softcap)
         return logits.reshape(bsz, seqlen, -1)
 
-    def _run_blocks_stateful(self, x: Tensor, x0: Tensor, input_ids: Tensor | None = None,
+    def _run_blocks_stateful(self, x: Tensor, x0: Tensor,
                              layer_states: list | None = None):
-        """Like _run_blocks but carries SSM state per layer. Returns (output, new_layer_states).
-        Note: when looping, the same physical block may appear multiple times in the index list.
-        Each *appearance* gets its own state slot — the state from pass 1 feeds into pass 2."""
-        ve_cache = self.ve_shared(input_ids) if (self.ve_shared is not None and input_ids is not None) else None
+        """Like _run_blocks but carries SSM state per Mamba-3 layer. Returns (output, new_layer_states)."""
         new_states: list = []
         si = 0
-        if self.looping_active:
-            enc_idx, dec_idx = self.encoder_indices, self.decoder_indices
-        else:
-            enc_idx = list(range(self.num_encoder_layers))
-            dec_idx = list(range(self.num_encoder_layers, len(self.blocks)))
+        enc_idx = list(range(self.num_encoder_layers))
+        dec_idx = list(range(self.num_encoder_layers, len(self.blocks)))
         skips: list[Tensor] = []
         for bi in enc_idx:
             block = self.blocks[bi]
             if isinstance(block, Block):
                 prev = layer_states[si] if layer_states is not None else None
-                x, fstate = block.forward_stateful(x, x0, v_embed=self._get_ve(bi, ve_cache), ssm_states=prev)
+                x, fstate = block.forward_stateful(x, x0, ssm_states=prev)
                 new_states.append(fstate)
                 si += 1
             else:
-                x = block(x, x0, v_embed=self._get_ve(bi, ve_cache))
+                x = block(x, x0)
             skips.append(x)
         for i, bi in enumerate(dec_idx):
             if i < len(skips) and i < self.skip_weights.shape[1]:
@@ -1673,18 +1475,18 @@ class GPT(nn.Module):
             block = self.blocks[bi]
             if isinstance(block, Block):
                 prev = layer_states[si] if layer_states is not None else None
-                x, fstate = block.forward_stateful(x, x0, v_embed=self._get_ve(bi, ve_cache), ssm_states=prev)
+                x, fstate = block.forward_stateful(x, x0, ssm_states=prev)
                 new_states.append(fstate)
                 si += 1
             else:
-                x = block(x, x0, v_embed=self._get_ve(bi, ve_cache))
+                x = block(x, x0)
         return x, new_states
 
     def forward_logits_stateful(self, input_ids: Tensor, layer_states: list | None = None):
         """Forward returning (logits, new_layer_states) for stateful eval."""
         bsz, seqlen = input_ids.shape
         x = self._embed(input_ids)
-        x, new_states = self._run_blocks_stateful(x, x, input_ids, layer_states)
+        x, new_states = self._run_blocks_stateful(x, x, layer_states)
         x = self.final_norm(x).reshape(-1, x.size(-1))
         w = self.tok_emb.weight if self.tie_embeddings else self.lm_head.weight
         logits = self.logit_softcap * torch.tanh(F.linear(x, w) / self.logit_softcap)
@@ -1779,30 +1581,21 @@ def main() -> None:
         mlp_mult=args.mlp_mult,
         tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
-        use_bigram_hash=args.use_bigram_hash,
-        bigram_buckets=args.bigram_buckets, bigram_hash_dim=args.bigram_hash_dim,
         use_ortho_init=args.use_ortho_init,
         mamba3_d_state=args.mamba3_d_state, mamba3_expand=args.mamba3_expand,
         mamba3_headdim=args.mamba3_headdim, mamba3_chunk_size=args.mamba3_chunk_size,
         mamba3_ngroups=args.mamba3_ngroups, mamba3_rope_fraction=args.mamba3_rope_fraction,
-        mamba3_outproj_norm=args.mamba3_outproj_norm,
-        mamba3_in_proj_rank=args.mamba3_in_proj_rank,
         num_attn_layers=args.num_attn_layers, num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads, rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
-        ve_enabled=args.ve_enabled, ve_dim=args.ve_dim,
-        num_loops=args.num_loops, loop_start=args.loop_start, loop_end=args.loop_end,
-        attn_window=args.attn_seq_len,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    if args.progressive_ctx:
-        torch._dynamo.config.recompile_limit = 64  # progressive context needs many shape variants
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=False)
-    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False,
-                           find_unused_parameters=(args.num_loops > 0)) if distributed else compiled_model
+    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) \
+                      if distributed else compiled_model
 
     block_named_params = list(base_model.blocks.named_parameters())
     matrix_params = [
@@ -1815,18 +1608,8 @@ def main() -> None:
     ]
     if hasattr(base_model, 'skip_weights') and base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
-    if base_model.bigram_hash is not None:
-        scalar_params.append(base_model.bigram_hash.table.weight)
-        matrix_params.append(base_model.bigram_hash.proj.weight)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     tok_params = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]
-    if base_model.ve_shared is not None:
-        tok_params.append({"params": [base_model.ve_shared.embed.weight], "lr": token_lr, "base_lr": token_lr})
-        scalar_params.append(base_model.ve_shared.scale)
-        for p in base_model.ve_layer_scales:
-            scalar_params.append(p)
-        if base_model.ve_shared.proj is not None:
-            matrix_params.append(base_model.ve_shared.proj.weight)
     optimizer_tok = torch.optim.Adam(
         tok_params, weight_decay=args.embed_wd,
         betas=(args.beta1, args.beta2), eps=args.adam_eps, fused=True,
@@ -1854,9 +1637,8 @@ def main() -> None:
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0(f"mode:mamba3_hybrid num_attn_layers:{args.num_attn_layers} attn_indices:{base_model.attn_indices}")
-    log0(f"ssd: d_state:{args.mamba3_d_state} expand:{args.mamba3_expand} headdim:{args.mamba3_headdim} ngroups:{args.mamba3_ngroups} rope_frac:{args.mamba3_rope_fraction} outproj_norm:{args.mamba3_outproj_norm} in_proj_rank:{args.mamba3_in_proj_rank}")
-    log0(f"attn: num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads} rope_base:{args.rope_base}" +
-         (f" window:{args.attn_seq_len}" if args.attn_seq_len > 0 else ""))
+    log0(f"ssd: d_state:{args.mamba3_d_state} expand:{args.mamba3_expand} headdim:{args.mamba3_headdim} ngroups:{args.mamba3_ngroups} rope_frac:{args.mamba3_rope_fraction}")
+    log0(f"attn: num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads} rope_base:{args.rope_base}")
     log0(f"num_layers:{args.num_layers} mlp_mult:{args.mlp_mult}")
     if args.muon_eq_r:
         log0(f"muon_eq_r:enabled")
@@ -1879,15 +1661,6 @@ def main() -> None:
             opt.zero_grad(set_to_none=True)
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
-
-    # Parse progressive context schedule: "0.3:1024,0.6:2048" → [(0.3, 1024), (0.6, 2048)]
-    _progressive_schedule: list[tuple[float, int]] = []
-    if args.progressive_ctx:
-        for entry in args.progressive_ctx.split(","):
-            frac_str, len_str = entry.strip().split(":")
-            _progressive_schedule.append((float(frac_str), int(len_str)))
-        _progressive_schedule.sort()
-        log0(f"progressive_ctx: {_progressive_schedule} → final {args.train_seq_len}")
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
         if args.warmdown_iters <= 0:
@@ -1922,43 +1695,6 @@ def main() -> None:
             zero_grad_all()
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
                 log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
-        # Pre-warm progressive context seq_lens so torch.compile caches all shapes upfront.
-        # Without this, dynamo hits recompile_limit and falls back to eager mode.
-        if _progressive_schedule:
-            warmup_seq_lens = sorted(set(slen for _, slen in _progressive_schedule))
-            for slen in warmup_seq_lens:
-                log0(f"progressive_warmup: seq_len={slen}")
-                zero_grad_all()
-                for micro_step in range(grad_accum_steps):
-                    if distributed:
-                        model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-                    x, y = train_loader.next_batch(args.train_batch_tokens, slen, grad_accum_steps)
-                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                        warmup_loss = model(x, y)
-                    (warmup_loss * grad_scale).backward()
-                for opt in optimizers:
-                    opt.step()
-                zero_grad_all()
-
-        # Pre-warm the looped graph too so torch.compile caches both variants
-        if args.num_loops > 0:
-            base_model.looping_active = True
-            log0(f"loop_warmup:enabled encoder:{base_model.encoder_indices} decoder:{base_model.decoder_indices}")
-            for warmup_step in range(args.warmup_steps):
-                zero_grad_all()
-                for micro_step in range(grad_accum_steps):
-                    if distributed:
-                        model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-                    x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                        warmup_loss = model(x, y)
-                    (warmup_loss * grad_scale).backward()
-                for opt in optimizers:
-                    opt.step()
-                zero_grad_all()
-                if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
-                    log0(f"loop_warmup_step:{warmup_step + 1}/{args.warmup_steps}")
-            base_model.looping_active = False
 
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
@@ -1969,7 +1705,6 @@ def main() -> None:
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     training_time_ms = 0.0
-    cur_seq_len = args.train_seq_len
     stop_after_step: int | None = None
     swa_state: dict[str, Tensor] | None = None
     swa_count = 0
@@ -2010,16 +1745,6 @@ def main() -> None:
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
 
-        if args.qat_start_frac > 0 and max_wallclock_ms:
-            elapsed_frac_qat = elapsed_ms / max_wallclock_ms
-            qat_active = elapsed_frac_qat >= args.qat_start_frac
-            qat_bits = args.quant_bits if qat_active else 0
-            if qat_active and any(m._qat_bits == 0 for m in base_model.modules() if isinstance(m, CastedLinear)):
-                log0(f"qat:enabled bits={qat_bits} at step {step} frac={elapsed_frac_qat:.2f}")
-                for m in base_model.modules():
-                    if isinstance(m, CastedLinear):
-                        m._qat_bits = qat_bits
-
         # Late QAT: trigger when lr_mul drops below threshold (SOTA approach)
         if args.late_qat_threshold > 0 and scale < args.late_qat_threshold:
             if any(m._qat_bits == 0 for m in base_model.modules() if isinstance(m, CastedLinear)):
@@ -2033,21 +1758,10 @@ def main() -> None:
 
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
-        # Progressive context: ramp seq_len based on elapsed wallclock fraction.
-        prev_seq_len = cur_seq_len
-        cur_seq_len = args.train_seq_len
-        if _progressive_schedule and max_wallclock_ms:
-            elapsed_frac = elapsed_ms / max_wallclock_ms
-            for frac_end, slen in _progressive_schedule:
-                if elapsed_frac < frac_end:
-                    cur_seq_len = slen
-                    break
-        if step > 0 and cur_seq_len != prev_seq_len:
-            log0(f"progressive_ctx:transition seq_len {prev_seq_len}→{cur_seq_len} at step {step} frac={elapsed_frac:.3f}")
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-            x, y = train_loader.next_batch(args.train_batch_tokens, cur_seq_len, grad_accum_steps)
+            x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
             train_loss += loss.detach()
@@ -2087,14 +1801,6 @@ def main() -> None:
                 swa_count += 1
 
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
-
-        # Delayed layer loop activation
-        if args.num_loops > 0 and not base_model.looping_active:
-            frac = approx_training_time_ms / (max_wallclock_ms or 600_000)
-            if frac >= args.enable_looping_at:
-                base_model.looping_active = True
-                log0(f"layer_loop:enabled step:{step} frac:{frac:.3f} "
-                     f"encoder:{base_model.encoder_indices} decoder:{base_model.decoder_indices}")
 
         should_log_train = (
             args.train_log_every > 0
@@ -2213,8 +1919,7 @@ def main() -> None:
                         cr_t = torch.full((t_cpu.shape[0],), float(cr), dtype=torch.float32)
                         cr_t[dyn_mask] = float(dyn_cr)
                         cr = cr_t
-                cs = args.gptq_embed_clip_sigmas if (is_embed and args.gptq_embed_clip_sigmas > 0) else args.gptq_clip_sigmas
-                q, s = quantize_int6_gptq(t_cpu, hessian=H, clip_range=cr, clip_sigmas=cs)
+                q, s = quantize_int6_gptq(t_cpu, hessian=H, clip_range=cr)
                 gptq_sd[name] = (q.float() * s.float()[:, None]).to(t_cpu.dtype)
             else:
                 gptq_sd[name] = t_cpu
@@ -2225,12 +1930,12 @@ def main() -> None:
 
     quant_obj, quant_stats = quantize_state_dict_int8(
         base_model.state_dict(), quant_bits=args.quant_bits,
-        quant_bits_mlp=args.quant_bits_mlp, quant_bits_embed=args.quant_bits_embed,
+        quant_bits_embed=args.quant_bits_embed,
         search_clip=args.gptq_lite,
         quant_bits_ssm_dynamics=args.quant_bits_ssm_dynamics, ssm_cfg=ssm_cfg,
     )
     # Selective ±1 pruning: zero out least-impactful ±1 quantized values to fit target size
-    if (args.use_lzma or args.use_brotli) and args.target_mb > 0 and master_process:
+    if args.use_lzma and args.target_mb > 0 and master_process:
         target_bytes = int(args.target_mb * 1024 * 1024)
         code_bytes_est = len(code.encode("utf-8"))
         ones_info = []
@@ -2248,9 +1953,6 @@ def main() -> None:
         if ones_info:
             ones_info.sort(key=lambda x: x[2])
             def _compress_for_prune(raw):
-                if args.use_brotli:
-                    import brotli
-                    return brotli.compress(raw, quality=11)
                 return lzma.compress(raw, preset=9)
             def _try_prune(n):
                 tmp_q = {k: v.clone() for k, v in quant_obj["quantized"].items()}
@@ -2281,17 +1983,9 @@ def main() -> None:
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
-    if args.use_brotli:
-        import brotli
-        quant_blob = brotli.compress(quant_raw, quality=11)
-        compress_fmt = "brotli-11"
-    elif args.use_lzma:
+    if args.use_lzma:
         quant_blob = lzma.compress(quant_raw, preset=9)
         compress_fmt = "lzma-9"
-    elif args.use_zstd and HAS_ZSTD:
-        cctx = zstd.ZstdCompressor(level=22)
-        quant_blob = cctx.compress(quant_raw)
-        compress_fmt = "zstd-22"
     else:
         quant_blob = zlib.compress(quant_raw, level=9)
         compress_fmt = "zlib-9"
@@ -2313,14 +2007,8 @@ def main() -> None:
         dist.barrier()
     with open(quant_filename, "rb") as f:
         quant_blob_disk = f.read()
-    if args.use_brotli:
-        import brotli
-        quant_decompressed = brotli.decompress(quant_blob_disk)
-    elif args.use_lzma:
+    if args.use_lzma:
         quant_decompressed = lzma.decompress(quant_blob_disk)
-    elif args.use_zstd and HAS_ZSTD:
-        dctx = zstd.ZstdDecompressor()
-        quant_decompressed = dctx.decompress(quant_blob_disk)
     else:
         quant_decompressed = zlib.decompress(quant_blob_disk)
     quant_state = torch.load(io.BytesIO(quant_decompressed), map_location="cpu")
